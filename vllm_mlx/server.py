@@ -60,6 +60,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+# @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — thin re-exports. The real
+# implementations live in vllm_mlx.api.mcp_inject so they can be imported
+# and tested without the mlx / metal-heavy engine side of this module.
+from .api.mcp_inject import (
+    log_mcp_auto_inject_status as _log_mcp_auto_inject_status,
+    resolve_effective_tools as _resolve_effective_tools,
+)
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -143,6 +150,10 @@ def _resolve_top_p(request_value: float | None) -> float:
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
+
+# @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — opt-in flag set from CLI.
+# Default OFF preserves bit-for-bit compat with Qwen 3.5 per REQ-N2.
+_auto_inject_mcp_tools: bool = False
 
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
@@ -1480,8 +1491,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
     # Add tools if provided
-    if request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — resolve the effective tool
+    # list through _resolve_effective_tools so the /v1/chat/completions
+    # endpoint can optionally surface MCP-registered tools to the model.
+    # When --auto-inject-mcp-tools is OFF this is a no-op and behaviour is
+    # bit-for-bit identical to the pre-Phase-2 server (REQ-N2).
+    effective_tools = _resolve_effective_tools(
+        request.tools, _mcp_manager, _auto_inject_mcp_tools
+    )
+    if effective_tools:
+        chat_kwargs["tools"] = convert_tools_for_template(effective_tools)
 
     if request.stream:
         return StreamingResponse(
@@ -2289,6 +2308,18 @@ Examples:
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
     )
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject
+    parser.add_argument(
+        "--auto-inject-mcp-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Auto-inject MCP-registered tools into /v1/chat/completions "
+            "requests that do not provide their own 'tools' field. When the "
+            "request already has tools, MCP tools are merged (client tools "
+            "win on name collision). Default: off."
+        ),
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -2383,6 +2414,11 @@ Examples:
     # Set MCP config for lifespan
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — propagate flag + log status.
+    global _auto_inject_mcp_tools
+    _auto_inject_mcp_tools = bool(args.auto_inject_mcp_tools)
+    _log_mcp_auto_inject_status(_auto_inject_mcp_tools)
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:

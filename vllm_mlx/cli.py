@@ -145,6 +145,13 @@ def serve_command(args):
         print(f"MCP config: {args.mcp_config}")
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — propagate CLI flag to the
+    # server module's single source of truth. The startup log line is emitted
+    # from the server module itself via _log_mcp_auto_inject_status() so the
+    # status is visible in both the CLI and the FastAPI lifespan path.
+    server._auto_inject_mcp_tools = bool(args.auto_inject_mcp_tools)
+    server._log_mcp_auto_inject_status(server._auto_inject_mcp_tools)
+
     # Pre-load embedding model if specified
     if args.embedding_model:
         print(f"Pre-loading embedding model: {args.embedding_model}")
@@ -766,6 +773,20 @@ Examples:
         type=str,
         default=None,
         help="Path to MCP configuration file (JSON/YAML) for tool integration",
+    )
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — opt-in automatic MCP tool
+    # injection into /v1/chat/completions. Default stays OFF so bit-for-bit
+    # compat with Qwen 3.5 is preserved per SPEC-FIX-QWEN36-RUNTIME REQ-N2.
+    serve_parser.add_argument(
+        "--auto-inject-mcp-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Auto-inject MCP-registered tools into /v1/chat/completions "
+            "requests that do not provide their own 'tools' field. When the "
+            "request already has tools, MCP tools are merged (client tools "
+            "win on name collision). Default: off."
+        ),
     )
     # Security options
     serve_parser.add_argument(
