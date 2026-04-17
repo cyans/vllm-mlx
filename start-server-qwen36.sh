@@ -34,8 +34,12 @@ source .venv/bin/activate
 # - 긴 reasoning 응답으로 인한 체감 멈춤을 줄이기 위해 max tokens 축소
 # - 디스크 prefix cache 자동 복구를 끄고 캐시 메모리 점유를 낮춤
 # - request timeout을 줄여 비정상적으로 오래 걸리는 요청을 빨리 정리
+# @CODE:FIX-QWEN36-RUNTIME/parser-resolver — route REASONING_PARSER
+# through resolve_reasoning_parser(model_id, env) so the 3.6 quant picks
+# up the new "qwen36" parser automatically. Operators can still force a
+# specific parser via VLLM_MLX_REASONING_PARSER.
 MODEL_ID="${VLLM_MLX_MODEL_ID:-$(.venv/bin/python -c 'from vllm_mlx.config.models import QWEN36_PROFILE; print(QWEN36_PROFILE.model_id)')}"
-REASONING_PARSER="$(.venv/bin/python -c 'from vllm_mlx.config.models import REASONING_PARSER; print(REASONING_PARSER)')"
+REASONING_PARSER="$(_RESOLVER_MODEL_ID="$MODEL_ID" .venv/bin/python -c 'import os; from vllm_mlx.config.models import resolve_reasoning_parser; print(resolve_reasoning_parser(os.environ.get("_RESOLVER_MODEL_ID", ""), env=os.environ))')"
 exec vllm-mlx serve "$MODEL_ID" \
   --host 0.0.0.0 \
   --port 8001 \

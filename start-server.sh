@@ -18,8 +18,11 @@ source .venv/bin/activate
 # - request timeout을 줄여 비정상적으로 오래 걸리는 요청을 빨리 정리
 # @CODE:MIGRATE-QWEN36/launcher — spec §6.2: model id and reasoning parser
 # are owned by vllm_mlx.config.models, not hardcoded here.
+# @CODE:FIX-QWEN36-RUNTIME/parser-resolver — REASONING_PARSER now flows
+# through resolve_reasoning_parser(model_id, env) so a 3.6 model id picks
+# up the "qwen36" parser automatically while 3.5 keeps "qwen3".
 MODEL_ID="${VLLM_MLX_MODEL_ID:-$(.venv/bin/python -c 'from vllm_mlx.config.models import resolve_model_id; print(resolve_model_id())')}"
-REASONING_PARSER="$(.venv/bin/python -c 'from vllm_mlx.config.models import REASONING_PARSER; print(REASONING_PARSER)')"
+REASONING_PARSER="$(_RESOLVER_MODEL_ID="$MODEL_ID" .venv/bin/python -c 'import os; from vllm_mlx.config.models import resolve_reasoning_parser; print(resolve_reasoning_parser(os.environ.get("_RESOLVER_MODEL_ID", ""), env=os.environ))')"
 exec vllm-mlx serve "$MODEL_ID" \
   --host 0.0.0.0 \
   --port 8001 \
