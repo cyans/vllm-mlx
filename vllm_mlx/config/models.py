@@ -29,20 +29,28 @@ from dataclasses import dataclass
 # Model identifiers
 # ---------------------------------------------------------------------------
 # @CODE:MIGRATE-QWEN36/config
-DEFAULT_MODEL_ID: str = "mlx-community/Qwen3.5-35B-A3B-4bit"
+# @CODE:MIGRATE-QWEN36/phase3 — Phase 3 cutover: DEFAULT flipped to Qwen3.6.
+# Note: this literal must stay in sync with ``QWEN36_PROFILE.model_id`` below.
+# Because ``QWEN36_PROFILE`` is defined after this constant, we cannot
+# reference it directly here without reordering the module. The module-level
+# ``assert`` after the profile block enforces that they never drift.
+DEFAULT_MODEL_ID: str = "mlx-community/Qwen3.6-35B-A3B-4bit"
 """Active default model ID.
 
 Used when neither the ``VLLM_MLX_MODEL_ID`` environment variable nor an
-explicit CLI override is provided. Phase 1 keeps this at the Qwen3.5 quant
-to preserve current behavior; Phase 3 will flip it to the Qwen3.6 quant.
+explicit CLI override is provided. Phase 3 flips this from the Qwen3.5
+quant to the Qwen3.6 quant. Operators can opt back into Qwen3.5 by setting
+``VLLM_MLX_MODEL_ID`` to :data:`LEGACY_MODEL_ID` or the literal id string.
 """
 
 LEGACY_MODEL_ID: str = "mlx-community/Qwen3.5-35B-A3B-4bit"
 """Previous-generation model ID retained for rollback.
 
-In Phase 1 this equals ``DEFAULT_MODEL_ID``. In Phase 3 it will diverge
-(``DEFAULT_MODEL_ID`` becomes the Qwen3.6 quant while this constant still
-points at the Qwen3.5 quant).
+Phase 1 and Phase 2 had this equal to :data:`DEFAULT_MODEL_ID`. Phase 3
+diverges them: :data:`DEFAULT_MODEL_ID` becomes the Qwen3.6 quant while
+this constant continues to point at the Qwen3.5 quant. Set
+``VLLM_MLX_MODEL_ID`` to this value to opt back into the previous
+generation without editing launcher scripts.
 """
 
 # ---------------------------------------------------------------------------
@@ -124,7 +132,10 @@ class ModelProfile:
 #   so the chain-of-thought does not collapse to deterministic loops).
 # Sources: https://github.com/QwenLM/Qwen2.5 README sampling section.
 QWEN35_PROFILE: ModelProfile = ModelProfile(
-    model_id=DEFAULT_MODEL_ID,
+    # @CODE:MIGRATE-QWEN36/phase3 — Phase 3 flipped DEFAULT to 3.6, so the
+    # 3.5 profile must be bound to ``LEGACY_MODEL_ID`` (the 3.5 quant)
+    # rather than ``DEFAULT_MODEL_ID`` to preserve its identity.
+    model_id=LEGACY_MODEL_ID,
     instruct=SamplingDefaults(
         temperature=0.7,
         top_p=0.8,
@@ -183,10 +194,19 @@ PROFILES: dict[str, ModelProfile] = {
 
 Phase 2 registers both the Qwen3.5 and Qwen3.6 profiles so callers can
 look up sampling defaults and capability flags for either quant without
-conditional logic. Phase 3 will flip :data:`DEFAULT_MODEL_ID` to the 3.6
-entry; :data:`LEGACY_MODEL_ID` will continue to point at the 3.5 entry
+conditional logic. Phase 3 flips :data:`DEFAULT_MODEL_ID` to the 3.6
+entry; :data:`LEGACY_MODEL_ID` continues to point at the 3.5 entry
 for rollback.
 """
+
+# @CODE:MIGRATE-QWEN36/phase3 — Module-level coupling guard.
+# ``DEFAULT_MODEL_ID`` is defined as a literal (before ``QWEN36_PROFILE``
+# exists), so this assertion pins the two together and fails import-time
+# if a future edit breaks the invariant.
+assert QWEN36_PROFILE.model_id == DEFAULT_MODEL_ID, (
+    "DEFAULT_MODEL_ID must equal QWEN36_PROFILE.model_id "
+    f"(got {DEFAULT_MODEL_ID!r} vs {QWEN36_PROFILE.model_id!r})"
+)
 
 
 # ---------------------------------------------------------------------------

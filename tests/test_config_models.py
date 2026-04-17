@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Characterization tests for ``vllm_mlx.config.models``.
 
-These tests freeze the Phase 1 and Phase 2 contract of the centralized
-model configuration module introduced by SPEC-MIGRATE-QWEN36. They are
-unit-level: no server boot, no model download, no ``mlx_lm`` load. The
-goal is to lock down the public API so that Phase 3 changes that flip
-``DEFAULT_MODEL_ID`` must be explicit and reviewed.
+These tests freeze the Phase 1, Phase 2, and Phase 3 contract of the
+centralized model configuration module introduced by SPEC-MIGRATE-QWEN36.
+They are unit-level: no server boot, no model download, no ``mlx_lm``
+load. The goal is to lock down the public API so that future changes
+affecting default model selection are explicit and reviewed.
 
 Phase 2 changes locked in by this suite:
 
@@ -14,9 +14,15 @@ Phase 2 changes locked in by this suite:
   ``"qwen3"`` strings (without a version suffix) no longer match.
 * A new :data:`~vllm_mlx.config.models.QWEN36_PROFILE` is registered in
   :data:`~vllm_mlx.config.models.PROFILES` alongside ``QWEN35_PROFILE``.
-* :data:`~vllm_mlx.config.models.DEFAULT_MODEL_ID` and
-  :data:`~vllm_mlx.config.models.LEGACY_MODEL_ID` still point at the
-  Qwen3.5 quant; Phase 3 will flip the default.
+
+Phase 3 changes locked in by this suite:
+
+* :data:`~vllm_mlx.config.models.DEFAULT_MODEL_ID` is flipped from the
+  Qwen3.5 quant to the Qwen3.6 quant.
+* :data:`~vllm_mlx.config.models.LEGACY_MODEL_ID` continues to point at
+  the Qwen3.5 quant (they now diverge — this is the rollback handle).
+* ``resolve_model_id`` without an override returns the Qwen3.6 quant.
+* Setting ``VLLM_MLX_MODEL_ID=LEGACY_MODEL_ID`` restores Qwen3.5.
 
 @TEST:MIGRATE-QWEN36
 """
@@ -51,17 +57,19 @@ from vllm_mlx.config.models import (
 class TestModelIdentifiers:
     """Freeze the Phase 1 / Phase 2 model-identifier contract."""
 
-    def test_default_model_id_is_qwen35(self) -> None:
-        # REQ-U1: DEFAULT_MODEL_ID must remain the 3.5 quant through Phase 2.
-        # Phase 3 will flip this to the 3.6 quant — that change must break
-        # this test deliberately.
-        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    def test_default_model_id_is_qwen36_after_phase3(self) -> None:
+        # REQ-U1 (Phase 3 cutover): DEFAULT_MODEL_ID is now the 3.6 quant.
+        # Duplicate of TestPhase3Cutover.test_default_model_id_is_qwen36
+        # kept here so TestModelIdentifiers remains a complete snapshot of
+        # the module-level identifier contract.
+        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
 
-    def test_legacy_model_id_equals_default_in_phase1_and_phase2(self) -> None:
-        # Phase 1 and Phase 2 invariant: legacy and default coincide. Phase
-        # 3 will diverge them (default -> 3.6, legacy still -> 3.5).
-        assert LEGACY_MODEL_ID == DEFAULT_MODEL_ID
+    def test_legacy_model_id_stays_on_qwen35(self) -> None:
+        # Phase 3 invariant: LEGACY_MODEL_ID remains pinned to the 3.5
+        # quant and now diverges from DEFAULT_MODEL_ID. This is the
+        # rollback handle documented in CHANGELOG.md.
         assert LEGACY_MODEL_ID == "mlx-community/Qwen3.5-35B-A3B-4bit"
+        assert LEGACY_MODEL_ID != DEFAULT_MODEL_ID
 
     def test_reasoning_parser_is_qwen3(self) -> None:
         assert REASONING_PARSER == "qwen3"
@@ -217,13 +225,17 @@ class TestImmutability:
             QWEN35_PROFILE.max_context_tokens = 99  # type: ignore[misc]
 
     def test_profiles_contains_qwen35(self) -> None:
-        assert DEFAULT_MODEL_ID in PROFILES
-        assert PROFILES[DEFAULT_MODEL_ID] is QWEN35_PROFILE
+        # Phase 3: QWEN35_PROFILE is keyed by LEGACY_MODEL_ID (the 3.5
+        # quant) now that DEFAULT_MODEL_ID has flipped to 3.6.
+        assert LEGACY_MODEL_ID in PROFILES
+        assert PROFILES[LEGACY_MODEL_ID] is QWEN35_PROFILE
 
     def test_qwen35_profile_fields_present(self) -> None:
         # Spot-check shape: all six top-level fields and both nested
         # SamplingDefaults instances are wired up.
-        assert QWEN35_PROFILE.model_id == DEFAULT_MODEL_ID
+        # Phase 3: the 3.5 profile's model_id is LEGACY_MODEL_ID, not
+        # DEFAULT_MODEL_ID (DEFAULT now resolves to 3.6).
+        assert QWEN35_PROFILE.model_id == LEGACY_MODEL_ID
         assert isinstance(QWEN35_PROFILE.instruct, SamplingDefaults)
         assert isinstance(QWEN35_PROFILE.thinking, SamplingDefaults)
         assert QWEN35_PROFILE.max_context_tokens > 0
@@ -295,6 +307,40 @@ class TestQwen36Profile:
             assert sd.top_k > 0
             assert sd.repetition_penalty >= 1.0
             assert sd.max_tokens > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 cutover — DEFAULT_MODEL_ID flipped to Qwen3.6
+# ---------------------------------------------------------------------------
+class TestPhase3Cutover:
+    """Phase 3 locks in the default flip from Qwen3.5 to Qwen3.6.
+
+    @TEST:MIGRATE-QWEN36/phase3
+    """
+
+    def test_default_model_id_is_qwen36(self) -> None:
+        # REQ-U1 (Phase 3): DEFAULT_MODEL_ID flips from 3.5 to 3.6.
+        assert QWEN36_PROFILE.model_id == DEFAULT_MODEL_ID
+        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
+
+    def test_legacy_model_id_is_qwen35(self) -> None:
+        # Phase 3: LEGACY_MODEL_ID continues to point at the 3.5 quant for
+        # rollback via VLLM_MLX_MODEL_ID.
+        assert LEGACY_MODEL_ID == "mlx-community/Qwen3.5-35B-A3B-4bit"
+
+    def test_legacy_differs_from_default_phase3(self) -> None:
+        # Phase 3 invariant: default and legacy diverge (3.6 vs 3.5).
+        assert LEGACY_MODEL_ID != DEFAULT_MODEL_ID
+
+    def test_resolve_model_id_default_is_qwen36(self) -> None:
+        # Explicit assertion: no env override => 3.6 quant is returned.
+        assert resolve_model_id({}) == "mlx-community/Qwen3.6-35B-A3B-4bit"
+
+    def test_resolve_model_id_env_rollback_to_qwen35(self) -> None:
+        # Documented rollback path: operators set VLLM_MLX_MODEL_ID to
+        # LEGACY_MODEL_ID to opt back into the previous generation.
+        env = {"VLLM_MLX_MODEL_ID": LEGACY_MODEL_ID}
+        assert resolve_model_id(env) == "mlx-community/Qwen3.5-35B-A3B-4bit"
 
 
 # ---------------------------------------------------------------------------
