@@ -30,10 +30,10 @@ if [[ ! -d .venv ]]; then
 fi
 
 source .venv/bin/activate
-# 안정성 우선 설정 (start-server.sh와 동일 패턴):
-# - 긴 reasoning 응답으로 인한 체감 멈춤을 줄이기 위해 max tokens 축소
-# - 디스크 prefix cache 자동 복구를 끄고 캐시 메모리 점유를 낮춤
-# - request timeout을 줄여 비정상적으로 오래 걸리는 요청을 빨리 정리
+# 성능 튜닝 (start-server.sh와 동일 패턴):
+# - prefix cache 활성화: system prompt / MCP tool schema 재사용으로 TTFT 크게 감소
+# - KV cache memory를 40%로 상향: continuous batching에서 MLX unified memory 활용도 증대
+# - request timeout은 180초 유지
 # @CODE:FIX-QWEN36-RUNTIME/parser-resolver — route REASONING_PARSER
 # through resolve_reasoning_parser(model_id, env) so the 3.6 quant picks
 # up the new "qwen36" parser automatically. Operators can still force a
@@ -59,7 +59,6 @@ exec vllm-mlx serve "$MODEL_ID" \
   --reasoning-parser "$REASONING_PARSER" \
   --mcp-config mcp.json \
   --max-tokens 8192 \
-  --cache-memory-percent 0.08 \
-  --disable-prefix-cache \
+  --cache-memory-percent 0.4 \
   --timeout 180 \
   "${EXTRA_FLAGS[@]}"

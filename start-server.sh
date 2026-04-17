@@ -12,10 +12,10 @@ fi
 source .venv/bin/activate
 # Qwen 3.5 35B는 텍스트 전용이므로 --mllm 제거 (MLLM 경로는 tools 미전달 이슈 있음)
 # --host 0.0.0.0: 같은 네트워크의 다른 기기에서 접속 가능 (기본값이지만 명시)
-# 안정성 우선 설정:
-# - 긴 reasoning 응답으로 인한 체감 멈춤을 줄이기 위해 max tokens 축소
-# - 디스크 prefix cache 자동 복구를 끄고 캐시 메모리 점유를 낮춤
-# - request timeout을 줄여 비정상적으로 오래 걸리는 요청을 빨리 정리
+# 성능 튜닝 (Qwen 3.6 + MCP auto-inject 관찰 결과 반영):
+# - prefix cache 활성화: system prompt / MCP tool schema 재사용으로 TTFT 크게 감소
+# - KV cache memory를 40%로 상향: continuous batching에서 MLX unified memory 활용도 증대
+# - request timeout은 180초 유지
 # @CODE:MIGRATE-QWEN36/launcher — spec §6.2: model id and reasoning parser
 # are owned by vllm_mlx.config.models, not hardcoded here.
 # @CODE:FIX-QWEN36-RUNTIME/parser-resolver — REASONING_PARSER now flows
@@ -41,7 +41,6 @@ exec vllm-mlx serve "$MODEL_ID" \
   --reasoning-parser "$REASONING_PARSER" \
   --mcp-config mcp.json \
   --max-tokens 8192 \
-  --cache-memory-percent 0.08 \
-  --disable-prefix-cache \
+  --cache-memory-percent 0.4 \
   --timeout 180 \
   "${EXTRA_FLAGS[@]}"
