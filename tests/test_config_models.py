@@ -47,6 +47,7 @@ from vllm_mlx.config.models import (
     SamplingDefaults,
     matches_eos_patch,
     resolve_model_id,
+    resolve_reasoning_parser,
     resolve_tool_parser,
 )
 
@@ -203,6 +204,91 @@ class TestResolveToolParser:
 
     def test_accepts_list(self) -> None:
         assert resolve_tool_parser(["mistral", "qwen"]) == "qwen"
+
+
+# ---------------------------------------------------------------------------
+# resolve_reasoning_parser — Phase 1 of SPEC-FIX-QWEN36-RUNTIME
+# ---------------------------------------------------------------------------
+class TestResolveReasoningParser:
+    """Freeze the Phase 1 contract of ``resolve_reasoning_parser``.
+
+    Precedence (high to low):
+      1. ``VLLM_MLX_REASONING_PARSER`` env override (wins unconditionally).
+      2. Model-id pattern match: ``qwen3.6`` => ``qwen36``; ``qwen3.5`` or
+         bare ``qwen3`` => ``qwen3``.
+      3. The module-level ``REASONING_PARSER`` default.
+
+    @TEST:FIX-QWEN36-RUNTIME/parser-resolver
+    """
+
+    def test_selects_qwen36_for_qwen36_model_id(self) -> None:
+        # REQ-U6: the 3.6 quant id must auto-select the new qwen36 parser
+        # so ``start-server-qwen36.sh`` picks it up without a manual flag.
+        assert (
+            resolve_reasoning_parser("mlx-community/Qwen3.6-35B-A3B-4bit")
+            == "qwen36"
+        )
+
+    def test_selects_qwen3_for_qwen35_model_id(self) -> None:
+        # REQ-N1 regression guard: the 3.5 quant id must keep resolving to
+        # the unchanged ``qwen3`` parser so the live Qwen3.5 server is
+        # unaffected by this fix.
+        assert (
+            resolve_reasoning_parser("mlx-community/Qwen3.5-35B-A3B-4bit")
+            == "qwen3"
+        )
+
+    def test_default_for_unknown_model(self) -> None:
+        # Unknown model id falls through to the module-level default,
+        # matching resolve_model_id / resolve_tool_parser style.
+        assert resolve_reasoning_parser("some-other-model") == REASONING_PARSER
+
+    def test_default_for_empty_model_id(self) -> None:
+        # Empty string must not match any pattern; caller receives the
+        # default so launchers never get an empty parser flag.
+        assert resolve_reasoning_parser("") == REASONING_PARSER
+
+    def test_env_override_wins_over_qwen36_pattern(self) -> None:
+        # Env var is an unconditional override — matches the pattern used
+        # by ``resolve_model_id(env)`` for ``VLLM_MLX_MODEL_ID``.
+        env = {"VLLM_MLX_REASONING_PARSER": "custom"}
+        assert (
+            resolve_reasoning_parser(
+                "mlx-community/Qwen3.6-35B-A3B-4bit", env=env
+            )
+            == "custom"
+        )
+
+    def test_env_override_ignored_when_empty(self) -> None:
+        # Empty env-var value mirrors "unset" shell convention.
+        env = {"VLLM_MLX_REASONING_PARSER": ""}
+        assert (
+            resolve_reasoning_parser(
+                "mlx-community/Qwen3.6-35B-A3B-4bit", env=env
+            )
+            == "qwen36"
+        )
+
+    def test_case_insensitive_pattern_match(self) -> None:
+        # Model id substring match is case-insensitive, matching
+        # ``matches_eos_patch`` semantics.
+        assert resolve_reasoning_parser("MLX-COMMUNITY/QWEN3.6-FOO") == "qwen36"
+        assert resolve_reasoning_parser("Qwen/Qwen3.5-35B-A3B") == "qwen3"
+
+    def test_bare_qwen3_resolves_to_qwen3(self) -> None:
+        # A bare "qwen3" substring without a version suffix falls back to
+        # the qwen3 parser (safe default for the Qwen3 family), NOT qwen36.
+        assert resolve_reasoning_parser("Qwen/Qwen3-7B") == "qwen3"
+
+
+class TestResolveReasoningParserPackageExport:
+    def test_exported_via_package(self) -> None:
+        # Caller convenience mirror of ``resolve_model_id``.
+        from vllm_mlx import config
+
+        assert config.resolve_reasoning_parser is (
+            config_models.resolve_reasoning_parser
+        )
 
 
 # ---------------------------------------------------------------------------

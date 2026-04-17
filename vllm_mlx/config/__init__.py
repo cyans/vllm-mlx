@@ -20,6 +20,7 @@ from vllm_mlx.config.models import (
     SamplingDefaults,
     matches_eos_patch,
     resolve_model_id,
+    resolve_reasoning_parser,
     resolve_tool_parser,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "QWEN36_PROFILE",
     "PROFILES",
     "resolve_model_id",
+    "resolve_reasoning_parser",
     "resolve_tool_parser",
     "matches_eos_patch",
 ]

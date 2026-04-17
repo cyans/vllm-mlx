@@ -246,6 +246,56 @@ def resolve_tool_parser(registered_parsers: Iterable[str]) -> str:
     return TOOL_PARSER_FALLBACK
 
 
+# @CODE:FIX-QWEN36-RUNTIME/parser-resolver — per-model reasoning-parser
+# resolver. Phase 1 of SPEC-MIGRATE-QWEN36 hard-coded ``REASONING_PARSER``
+# ("qwen3") in the launcher; Phase 1 of SPEC-FIX-QWEN36-RUNTIME introduces
+# this resolver so the 3.6 quant picks up the new ``qwen36`` parser
+# automatically while 3.5 continues to use the unchanged ``qwen3`` parser.
+_REASONING_PARSER_QWEN36 = "qwen36"
+
+
+def resolve_reasoning_parser(
+    model_id: str,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Return the ``--reasoning-parser`` flag value for ``model_id``.
+
+    Precedence (highest first):
+
+    1. ``VLLM_MLX_REASONING_PARSER`` env override — wins unconditionally
+       when present and non-empty. Matches the "unset = empty string"
+       shell convention used by :func:`resolve_model_id`.
+    2. Model-id pattern match (case-insensitive substring):
+       * ``"qwen3.6"`` → ``"qwen36"``
+       * ``"qwen3.5"`` or bare ``"qwen3"`` → ``"qwen3"``
+    3. Module-level :data:`REASONING_PARSER` default.
+
+    Passing ``env=None`` (the default) disables env lookup entirely so the
+    function is trivially unit-testable without touching :data:`os.environ`.
+    An empty ``model_id`` skips the pattern-match step and falls through to
+    the default.
+    """
+    # Step 1: env override.
+    if env is not None:
+        override = env.get("VLLM_MLX_REASONING_PARSER", "")
+        if override:
+            return override
+
+    # Step 2: model-id pattern match.
+    if model_id:
+        needle = model_id.lower()
+        if "qwen3.6" in needle:
+            return _REASONING_PARSER_QWEN36
+        # "qwen3.5" and bare "qwen3" both resolve to the existing qwen3
+        # parser. Ordering matters: check "qwen3.6" first so the more
+        # specific pattern wins.
+        if "qwen3" in needle:
+            return REASONING_PARSER
+
+    # Step 3: default.
+    return REASONING_PARSER
+
+
 def matches_eos_patch(model_id: str) -> bool:
     """Return ``True`` if ``model_id`` triggers the ``<|im_end|>`` EOS patch.
 
