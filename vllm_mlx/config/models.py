@@ -76,13 +76,19 @@ preferred parser. The ``qwen`` parser handles the classic
 # ---------------------------------------------------------------------------
 # EOS-patch substring patterns
 # ---------------------------------------------------------------------------
-EOS_PATCH_MODEL_PATTERNS: tuple[str, ...] = ("qwen3",)
+EOS_PATCH_MODEL_PATTERNS: tuple[str, ...] = ("qwen3.5", "qwen3.6")
 """Substrings that, when present in a model id, trigger the ``<|im_end|>``
 EOS override documented in ``vllm_mlx/models/llm.py``.
 
-Phase 1 keeps the single permissive pattern ``"qwen3"`` so that behavior
-matches the pre-refactor conditional exactly. Phase 2 will tighten this to
-``("qwen3.5", "qwen3.6")`` once the Qwen3.6 tokenizer config is verified.
+Phase 2 tightens the Phase 1 permissive ``("qwen3",)`` pattern to the
+explicit versioned pair ``("qwen3.5", "qwen3.6")``. Consequence: bare
+``"qwen3"`` tokens (for example ``Qwen/Qwen3-7B``) no longer trigger the
+EOS patch — the ``<|im_end|>`` override is specific to the 3.5 / 3.6
+tokenizer profile and should not silently be applied to future unrelated
+members of the Qwen3 family.
+
+Matching is case-insensitive and substring-based; see
+:func:`matches_eos_patch` for the comparison semantics.
 """
 
 
@@ -138,11 +144,48 @@ QWEN35_PROFILE: ModelProfile = ModelProfile(
     supports_multimodal=False,
 )
 
-PROFILES: dict[str, ModelProfile] = {QWEN35_PROFILE.model_id: QWEN35_PROFILE}
+# Qwen3.6 Hugging-Face model-card defaults.
+# - Instruct mode ("General"):  temperature=0.7, top_p=0.8,  top_k=20,
+#                               repetition_penalty=1.0.
+# - Thinking mode ("General Tasks"): temperature=1.0, top_p=0.95, top_k=20,
+#                                    repetition_penalty=1.0.
+# Max context per the 3.6 config is 262_144 tokens. The MLX-community
+# 4-bit quant ships with vision / audio / video special tokens in the
+# tokenizer config, so we advertise ``supports_multimodal=True`` at the
+# profile level; Phase 2 launchers still opt into text-only mode via
+# ``--language-model-only``.
+QWEN36_PROFILE: ModelProfile = ModelProfile(
+    model_id="mlx-community/Qwen3.6-35B-A3B-4bit",
+    instruct=SamplingDefaults(
+        temperature=0.7,
+        top_p=0.8,
+        top_k=20,
+        repetition_penalty=1.0,
+        max_tokens=32_768,
+    ),
+    thinking=SamplingDefaults(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        repetition_penalty=1.0,
+        max_tokens=32_768,
+    ),
+    max_context_tokens=262_144,
+    supports_tool_calling=True,
+    supports_multimodal=True,
+)
+
+PROFILES: dict[str, ModelProfile] = {
+    QWEN35_PROFILE.model_id: QWEN35_PROFILE,
+    QWEN36_PROFILE.model_id: QWEN36_PROFILE,
+}
 """Read-only map from model id to :class:`ModelProfile`.
 
-Phase 1 contains only the Qwen3.5 profile. Phase 3 will add ``QWEN36_PROFILE``
-with its own instruct/thinking sampling defaults and capability flags.
+Phase 2 registers both the Qwen3.5 and Qwen3.6 profiles so callers can
+look up sampling defaults and capability flags for either quant without
+conditional logic. Phase 3 will flip :data:`DEFAULT_MODEL_ID` to the 3.6
+entry; :data:`LEGACY_MODEL_ID` will continue to point at the 3.5 entry
+for rollback.
 """
 
 
