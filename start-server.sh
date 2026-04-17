@@ -34,6 +34,19 @@ if [[ "${VLLM_MLX_AUTO_INJECT_MCP_TOOLS:-0}" == "1" ]]; then
   EXTRA_FLAGS+=(--auto-inject-mcp-tools)
 fi
 
+# @CODE:FIX-QWEN36-AUTO-TOOL-CHOICE/launcher — enable auto-tool-choice by
+# default so clients do not need to pass tool_choice="auto" explicitly.
+# Operators who want the pre-Phase-1 behavior can set
+# VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE=1. --enable-auto-tool-choice requires
+# --tool-call-parser, so we resolve the parser via
+# vllm_mlx.config.models.resolve_tool_parser against the live
+# ToolParserManager registry (prefers "qwen3_coder", falls back to "qwen"),
+# and let operators force a specific value via VLLM_MLX_TOOL_CALL_PARSER.
+if [[ "${VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE:-0}" != "1" ]]; then
+  TOOL_CALL_PARSER="${VLLM_MLX_TOOL_CALL_PARSER:-$(.venv/bin/python -c 'from vllm_mlx.tool_parsers import ToolParserManager; from vllm_mlx.config.models import resolve_tool_parser; print(resolve_tool_parser(list(ToolParserManager.tool_parsers.keys())))')}"
+  EXTRA_FLAGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+fi
+
 exec vllm-mlx serve "$MODEL_ID" \
   --host 0.0.0.0 \
   --port 8001 \
