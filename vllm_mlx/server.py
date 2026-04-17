@@ -52,6 +52,7 @@ from collections.abc import AsyncIterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -102,6 +103,7 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
+from .config.models import resolve_tool_parser  # noqa: F401 — @CODE:MIGRATE-QWEN36/server
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .tool_parsers import ToolParserManager
 
@@ -240,6 +242,15 @@ app = FastAPI(
     description="OpenAI-compatible API for MLX LLM/MLLM inference on Apple Silicon",
     version="0.2.1",
     lifespan=lifespan,
+)
+
+# CORS: OPTIONS preflight from browsers / n8n etc. would otherwise get 405
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 security = HTTPBearer(auto_error=False)
@@ -639,6 +650,20 @@ async def list_models() -> ModelsResponse:
     return ModelsResponse(data=models)
 
 
+@app.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])
+async def get_model(model_id: str) -> ModelInfo:
+    """
+    Return a single model by id (OpenAI-compatible).
+    LangChain and other clients call this to resolve MODEL_NOT_FOUND; without it they get 404.
+    With a single loaded model, any model_id is accepted so that clients using different
+    naming (e.g. "default", full HF id, or alias) still get 200.
+    """
+    if not _model_name:
+        raise HTTPException(status_code=404, detail="No model loaded")
+    # Single-model server: accept any model_id so LangChain/n8n etc. don't get 404
+    return ModelInfo(id=_model_name)
+
+
 # =============================================================================
 # Embeddings Endpoint
 # =============================================================================
@@ -776,7 +801,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 async def list_mcp_tools() -> MCPToolsResponse:
     """List all available MCP tools."""
     if _mcp_manager is None:
-        return MCPToolsResponse(tools=[], count=0)
+        return MCPToolsResponse(tools=[], count=0, max_tool_calls=30)
 
     tools = []
     for tool in _mcp_manager.get_all_tools():
@@ -788,8 +813,10 @@ async def list_mcp_tools() -> MCPToolsResponse:
                 parameters=tool.input_schema,
             )
         )
-
-    return MCPToolsResponse(tools=tools, count=len(tools))
+    max_tool_calls = getattr(
+        _mcp_manager.config, "max_tool_calls", 30
+    )
+    return MCPToolsResponse(tools=tools, count=len(tools), max_tool_calls=max_tool_calls)
 
 
 @app.get("/v1/mcp/servers", dependencies=[Depends(verify_api_key)])
@@ -1239,6 +1266,99 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             total_tokens=total_prompt_tokens + total_completion_tokens,
         ),
     )
+
+
+def _responses_input_to_messages(body: dict) -> list:
+    """Convert OpenAI Responses API 'input' to chat 'messages'."""
+    inp = body.get("input")
+    if inp is None:
+        return body.get("messages", [])
+    if isinstance(inp, str):
+        return [{"role": "user", "content": inp}]
+    if not isinstance(inp, list):
+        return [{"role": "user", "content": str(inp)}]
+    messages = []
+    for item in inp:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+        elif isinstance(item, dict):
+            if item.get("type") == "input_text":
+                messages.append({"role": "user", "content": item.get("text", "")})
+            elif item.get("role") and "content" in item:
+                # Normalize content: convert input_text -> text for downstream
+                content = item["content"]
+                if isinstance(content, list):
+                    content = [
+                        {**part, "type": "text"} if isinstance(part, dict) and part.get("type") == "input_text" else part
+                        for part in content
+                    ]
+                messages.append(
+                    {"role": item["role"], "content": content}
+                )
+            else:
+                messages.append({"role": "user", "content": str(item)})
+        else:
+            messages.append({"role": "user", "content": str(item)})
+    return messages if messages else [{"role": "user", "content": ""}]
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_response(raw_request: Request):
+    """
+    Adapter for OpenAI Responses API (POST /v1/responses).
+    Converts request to chat completions and returns the same response shape
+    so clients (n8n, LangChain, etc.) that call /v1/responses get 200 instead of 404.
+    """
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+    messages = _responses_input_to_messages(body)
+    model = body.get("model") or _model_name or "default"
+    stream = body.get("stream", False)
+    # Build Message list: support dict or already Message-like
+    msg_list = []
+    for m in messages:
+        if isinstance(m, dict):
+            try:
+                msg_list.append(Message.model_validate(m))
+            except Exception:
+                msg_list.append(
+                    Message(role=m.get("role", "user"), content=m.get("content", ""))
+                )
+        else:
+            msg_list.append(m)
+    chat_request = ChatCompletionRequest(
+        model=model,
+        messages=msg_list,
+        stream=stream,
+        max_tokens=body.get("max_tokens") or body.get("max_output_tokens"),
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+    )
+    result = await create_chat_completion(chat_request, raw_request)
+
+    # n8n AI Agent expects response.output to be iterable (Responses API shape)
+    if isinstance(result, ChatCompletionResponse):
+        output_items = []
+        if result.choices:
+            msg = result.choices[0].message
+            text = (msg.content or "") if hasattr(msg, "content") else ""
+            output_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            })
+        return {
+            "id": getattr(result, "id", None),
+            "model": result.model,
+            "output": output_items,
+            "usage": result.usage.model_dump() if hasattr(result.usage, "model_dump") else result.usage,
+        }
+    return result
 
 
 @app.post(

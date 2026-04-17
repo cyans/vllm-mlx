@@ -26,8 +26,14 @@ def serve_command(args):
 
     # Import unified server
     from . import server
+    from .config.models import (
+        TOOL_PARSER_FALLBACK,
+        TOOL_PARSER_PREFERRED,
+        resolve_tool_parser,
+    )
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
+    from .tool_parsers import ToolParserManager
 
     logger = logging.getLogger(__name__)
 
@@ -45,10 +51,36 @@ def serve_command(args):
             requests_per_minute=args.rate_limit, enabled=True
         )
 
-    # Configure tool calling
+    # Configure tool calling.
+    # @CODE:MIGRATE-QWEN36/server — spec §6.3: resolve the tool-call parser
+    # against the live ToolParserManager registry, preferring
+    # TOOL_PARSER_PREFERRED ("qwen3_coder") and falling back to
+    # TOOL_PARSER_FALLBACK ("qwen"). An explicit --tool-call-parser CLI
+    # value always wins (behavior-preserving in Phase 1).
     if args.enable_auto_tool_choice and args.tool_call_parser:
         server._enable_auto_tool_choice = True
         server._tool_call_parser = args.tool_call_parser
+        try:
+            registered = list(ToolParserManager.tool_parsers.keys()) + list(
+                ToolParserManager.lazy_parsers.keys()
+            )
+            resolved = resolve_tool_parser(registered)
+            source = (
+                "preferred-available"
+                if resolved == TOOL_PARSER_PREFERRED
+                else "fallback"
+            )
+            logger.info(
+                "Tool parser selection: user=%s, resolved=%s (%s), "
+                "preferred=%s, fallback=%s",
+                args.tool_call_parser,
+                resolved,
+                source,
+                TOOL_PARSER_PREFERRED,
+                TOOL_PARSER_FALLBACK,
+            )
+        except Exception as e:  # noqa: BLE001 - log-only, never block startup
+            logger.warning("Tool parser resolution logging failed: %s", e)
     else:
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
