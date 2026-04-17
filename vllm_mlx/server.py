@@ -1986,6 +1986,163 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
+# @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — pure helper for chaining the
+# reasoning parser and the tool-call parser inside the SSE loop. Keeping the
+# decision logic in a side-effect-free function lets the streaming contract be
+# unit-tested without bringing up FastAPI, the MLX engine, or the HTTP layer.
+# Both the reasoning-parser branch and the plain-text branch of
+# ``stream_chat_completion`` call this helper so that ``<tool_call>`` XML is
+# never leaked to ``delta.content`` — fixes the P1 bug where Qwen3.6 streaming
+# responses emitted raw XML instead of ``delta.tool_calls``.
+
+
+class _ToolChainState:
+    """Mutable state shared across all deltas in one stream.
+
+    ``tool_accumulated_text`` tracks the text that has been passed through the
+    tool parser so far — note that this is the post-reasoning-parser text
+    (i.e. content only), so it never contains ``<think>`` markup. Both
+    branches of ``stream_chat_completion`` share one instance per stream so
+    the post-stream fallback at the end of ``stream_chat_completion`` can
+    still observe in-progress tool_call markup.
+
+    ``tool_markup_possible`` is a fast-path flag: once a ``<`` character is
+    seen, every subsequent delta must be re-scanned for tool markup. Before
+    then we can skip the O(n) tag-counting work entirely.
+
+    ``tool_calls_detected`` is flipped the first time a complete
+    ``</tool_call>`` block is formatted into a streaming tool_calls chunk.
+    """
+
+    __slots__ = (
+        "tool_accumulated_text",
+        "tool_markup_possible",
+        "tool_calls_detected",
+    )
+
+    def __init__(self) -> None:
+        self.tool_accumulated_text: str = ""
+        self.tool_markup_possible: bool = False
+        self.tool_calls_detected: bool = False
+
+
+class _ChainedDelta:
+    """Result of one chain invocation.
+
+    Any of ``content``, ``reasoning``, or ``tool_calls`` may be ``None``. The
+    caller decides which SSE shape to emit based on which fields are set.
+    ``None`` (returned from the helper itself, not this container) means
+    "suppress this delta entirely" — used while inside an incomplete
+    ``<tool_call>`` block.
+    """
+
+    __slots__ = ("content", "reasoning", "tool_calls")
+
+    def __init__(
+        self,
+        *,
+        content: str | None = None,
+        reasoning: str | None = None,
+        tool_calls: list[dict] | None = None,
+    ) -> None:
+        self.content = content
+        self.reasoning = reasoning
+        self.tool_calls = tool_calls
+
+
+def chain_reasoning_and_tool_parsers(
+    *,
+    previous_text: str,
+    current_text: str,
+    delta_text: str,
+    reasoning_parser,
+    tool_parser,
+    state: _ToolChainState,
+) -> _ChainedDelta | None:
+    """Route a streaming delta through the reasoning parser, then the tool parser.
+
+    Ordering rationale: the reasoning parser strips ``<think>`` / ``</think>``
+    and splits a delta into reasoning vs content channels. Only the content
+    channel can possibly carry a ``<tool_call>`` block, so we feed the
+    reasoning parser's ``content`` output (not the raw ``delta_text``) into
+    the tool parser. When no reasoning parser is configured we treat the
+    entire delta as content, which preserves the pre-fix behaviour for
+    non-reasoning models.
+
+    Returns ``None`` when the chunk must be suppressed (e.g. the tag token
+    itself, or a delta that lands inside an incomplete ``<tool_call>``
+    block). Returns a ``_ChainedDelta`` otherwise; the caller must emit an
+    SSE chunk iff at least one field on the delta is non-empty.
+    """
+    # ---- Step 1: reasoning parser -----------------------------------
+    reasoning_out: str | None = None
+    content_for_tool: str | None
+
+    if reasoning_parser is not None and delta_text:
+        delta_msg = reasoning_parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text
+        )
+        if delta_msg is None:
+            # Reasoning parser swallowed this delta (e.g. <think> token).
+            return None
+        reasoning_out = delta_msg.reasoning
+        content_for_tool = delta_msg.content
+    else:
+        # No reasoning parser active: the raw delta is all content.
+        content_for_tool = delta_text
+
+    # ---- Step 2: tool parser ---------------------------------------
+    # If there is no tool parser, or nothing to feed it, return the
+    # reasoning-parser output unchanged.
+    if tool_parser is None or not content_for_tool:
+        if reasoning_out is None and not content_for_tool:
+            # Reasoning-only chunks are valid (content may legitimately be
+            # empty during the reasoning phase).
+            return _ChainedDelta(reasoning=reasoning_out)
+        return _ChainedDelta(
+            content=content_for_tool, reasoning=reasoning_out
+        )
+
+    # Fast path: if no ``<`` has been seen yet and the current delta
+    # contains none, we know the tool parser has nothing to do.
+    if not state.tool_markup_possible and "<" not in content_for_tool:
+        state.tool_accumulated_text += content_for_tool
+        return _ChainedDelta(
+            content=content_for_tool, reasoning=reasoning_out
+        )
+
+    if not state.tool_markup_possible:
+        state.tool_markup_possible = True
+
+    tool_previous = state.tool_accumulated_text
+    state.tool_accumulated_text += content_for_tool
+    tool_result = tool_parser.extract_tool_calls_streaming(
+        tool_previous, state.tool_accumulated_text, content_for_tool
+    )
+
+    if tool_result is None:
+        # Inside an incomplete <tool_call> block: suppress this chunk.
+        # Reasoning output from this same delta is also suppressed — it is
+        # invariant in this codebase that reasoning content never coexists
+        # with tool-call markup in the same delta.
+        return None
+
+    if "tool_calls" in tool_result:
+        state.tool_calls_detected = True
+        return _ChainedDelta(
+            tool_calls=list(tool_result["tool_calls"]),
+            reasoning=reasoning_out,
+        )
+
+    # Normal content path: the tool parser echoed the delta back, possibly
+    # trimmed. Prefer the parser's ``content`` value so any internal
+    # sanitisation is respected.
+    return _ChainedDelta(
+        content=tool_result.get("content", content_for_tool),
+        reasoning=reasoning_out,
+    )
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -2029,11 +2186,12 @@ async def stream_chat_completion(
     last_output = None
 
     # Tool call streaming state
+    # @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — shared state across both
+    # the reasoning-parser branch and the plain-text branch so the post-stream
+    # fallback below can still observe in-progress tool_call markup.
     global _tool_parser_instance
     tool_parser = None
-    tool_accumulated_text = ""
-    tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
+    tool_chain_state = _ToolChainState()
     if _enable_auto_tool_choice and _tool_call_parser:
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
@@ -2061,119 +2219,127 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
+        # @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — unified chain path.
+        # Previously the reasoning-parser branch bypassed the tool parser, so
+        # Qwen3.6 streaming responses emitted raw ``<tool_call>`` XML in
+        # ``delta.content`` and never populated ``delta.tool_calls``. We now
+        # route every delta through ``chain_reasoning_and_tool_parsers`` so
+        # both parsers cooperate no matter which one is configured.
         if _reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, delta_text
-            )
-
-            if delta_msg is None:
-                # Skip this chunk (e.g., <think> token itself)
-                continue
-
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
-                        ),
-                        finish_reason=output.finish_reason if output.finished else None,
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
         else:
-            # Standard path without reasoning parsing
-            content = delta_text
+            previous_text = accumulated_text
+            accumulated_text = accumulated_text + (delta_text or "")
 
-            # Filter special tokens that may leak into streaming output
-            if content:
-                content = SPECIAL_TOKENS_PATTERN.sub("", content)
+        # Filter special tokens for the non-reasoning path. When a reasoning
+        # parser is active it already strips ``<think>`` / ``</think>``
+        # markup itself, so this extra sub() would be redundant (and risk
+        # double-stripping).
+        raw_delta = delta_text
+        if not _reasoning_parser and raw_delta:
+            raw_delta = SPECIAL_TOKENS_PATTERN.sub("", raw_delta)
 
-            # Add <think> prefix on first content chunk for thinking models
-            if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
-                think_prefix_sent = True
+        # Add <think> prefix on first content chunk for thinking models
+        # (only applies when no reasoning parser is active).
+        if (
+            not _reasoning_parser
+            and is_thinking_model
+            and not think_prefix_sent
+            and raw_delta
+        ):
+            raw_delta = "<think>" + raw_delta
+            think_prefix_sent = True
 
-            # Tool call streaming parsing
-            if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
-                    )
+        chained = chain_reasoning_and_tool_parsers(
+            previous_text=previous_text,
+            current_text=accumulated_text,
+            delta_text=raw_delta,
+            reasoning_parser=_reasoning_parser,
+            tool_parser=tool_parser,
+            state=tool_chain_state,
+        )
 
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
+        if chained is None:
+            # Inside a partial <tool_call> block (or the reasoning parser
+            # swallowed a tag token). Either way, emit nothing for this
+            # delta unless the upstream engine just finished — in which
+            # case the post-stream fallback below takes over.
+            if output.finished:
+                # Still need to emit a terminating chunk so clients see
+                # ``finish_reason``. This matches pre-fix behaviour for
+                # the suppressed-chunk path.
+                finish_reason = (
+                    "tool_calls"
+                    if tool_chain_state.tool_calls_detected
+                    else output.finish_reason
+                )
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(),
+                            finish_reason=finish_reason,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
+                    ],
+                    usage=get_usage(output),
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            continue
 
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
-
+        if chained.tool_calls:
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=content if content else None
+                            tool_calls=chained.tool_calls,
+                            reasoning=chained.reasoning,
                         ),
                         finish_reason=(
-                            "tool_calls"
-                            if (output.finished and tool_calls_detected)
-                            else (output.finish_reason if output.finished else None)
+                            "tool_calls" if output.finished else None
                         ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+            continue
+
+        finish_reason = (
+            "tool_calls"
+            if (output.finished and tool_chain_state.tool_calls_detected)
+            else (output.finish_reason if output.finished else None)
+        )
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        content=chained.content if chained.content else None,
+                        reasoning=chained.reasoning,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=get_usage(output) if output.finished else None,
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
     # (e.g., </tool_call> never arrived - incomplete tool call)
     if (
         tool_parser
-        and tool_accumulated_text
-        and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
+        and tool_chain_state.tool_accumulated_text
+        and not tool_chain_state.tool_calls_detected
+        and "<tool_call>" in tool_chain_state.tool_accumulated_text
     ):
-        result = tool_parser.extract_tool_calls(tool_accumulated_text)
+        result = tool_parser.extract_tool_calls(
+            tool_chain_state.tool_accumulated_text
+        )
         if result.tools_called:
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
