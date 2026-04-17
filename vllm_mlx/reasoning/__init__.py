@@ -25,6 +25,8 @@ Usage:
 """
 
 from .base import DeltaMessage, ReasoningParser
+from .qwen3_parser import Qwen3ReasoningParser
+from .qwen36_parser import Qwen36ReasoningParser
 from .think_parser import BaseThinkingReasoningParser
 
 # Parser registry
@@ -78,9 +80,13 @@ def _register_builtin_parsers():
     from .deepseek_r1_parser import DeepSeekR1ReasoningParser
     from .gpt_oss_parser import GptOssReasoningParser
     from .harmony_parser import HarmonyReasoningParser
-    from .qwen3_parser import Qwen3ReasoningParser
 
+    # @CODE:FIX-QWEN36-RUNTIME/parser — register the Qwen3.6 parser
+    # alongside the existing qwen3 (Qwen3.5) parser; the qwen3
+    # registration is intentionally untouched to preserve live-server
+    # behaviour.
     register_parser("qwen3", Qwen3ReasoningParser)
+    register_parser("qwen36", Qwen36ReasoningParser)
     register_parser("deepseek_r1", DeepSeekR1ReasoningParser)
     register_parser("gpt_oss", GptOssReasoningParser)
     register_parser("harmony", HarmonyReasoningParser)
@@ -95,6 +101,9 @@ __all__ = [
     "ReasoningParser",
     "DeltaMessage",
     "BaseThinkingReasoningParser",
+    # Concrete parsers (exposed so callers can ``isinstance``-check)
+    "Qwen3ReasoningParser",
+    "Qwen36ReasoningParser",
     # Registry functions
     "register_parser",
     "get_parser",
