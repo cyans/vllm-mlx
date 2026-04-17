@@ -23,6 +23,17 @@ source .venv/bin/activate
 # up the "qwen36" parser automatically while 3.5 keeps "qwen3".
 MODEL_ID="${VLLM_MLX_MODEL_ID:-$(.venv/bin/python -c 'from vllm_mlx.config.models import resolve_model_id; print(resolve_model_id())')}"
 REASONING_PARSER="$(_RESOLVER_MODEL_ID="$MODEL_ID" .venv/bin/python -c 'import os; from vllm_mlx.config.models import resolve_reasoning_parser; print(resolve_reasoning_parser(os.environ.get("_RESOLVER_MODEL_ID", ""), env=os.environ))')"
+
+# @CODE:FIX-QWEN36-RUNTIME/launcher — opt-in MCP tool auto-injection.
+# Operators can set VLLM_MLX_AUTO_INJECT_MCP_TOOLS=1 to surface
+# MCP-registered tools to the model when the client does not supply any.
+# Default stays OFF so bit-for-bit compat with Qwen 3.5 is preserved
+# (SPEC-FIX-QWEN36-RUNTIME REQ-N2).
+EXTRA_FLAGS=()
+if [[ "${VLLM_MLX_AUTO_INJECT_MCP_TOOLS:-0}" == "1" ]]; then
+  EXTRA_FLAGS+=(--auto-inject-mcp-tools)
+fi
+
 exec vllm-mlx serve "$MODEL_ID" \
   --host 0.0.0.0 \
   --port 8001 \
@@ -32,4 +43,5 @@ exec vllm-mlx serve "$MODEL_ID" \
   --max-tokens 8192 \
   --cache-memory-percent 0.08 \
   --disable-prefix-cache \
-  --timeout 180
+  --timeout 180 \
+  "${EXTRA_FLAGS[@]}"
