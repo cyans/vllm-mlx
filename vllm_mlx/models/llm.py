@@ -10,6 +10,8 @@ import logging
 from dataclasses import dataclass
 from typing import Iterator
 
+from vllm_mlx.config.models import matches_eos_patch
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,8 +83,10 @@ class MLXLanguageModel:
             tokenizer_config = {"trust_remote_code": self.trust_remote_code}
 
             # Qwen3 fix: eos_token changed from <|im_end|> to <|endoftext|>
-            # but chat template still uses <|im_end|>, so we need to set it explicitly
-            if "qwen3" in self.model_name.lower() or "Qwen3" in self.model_name:
+            # but chat template still uses <|im_end|>, so we need to set it explicitly.
+            # @CODE:MIGRATE-QWEN36/eos-patch — pattern list is owned by
+            # vllm_mlx.config.models.EOS_PATCH_MODEL_PATTERNS.
+            if matches_eos_patch(self.model_name):
                 tokenizer_config["eos_token"] = "<|im_end|>"
                 logger.info("Qwen3 detected: setting eos_token to <|im_end|>")
 
