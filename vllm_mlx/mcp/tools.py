@@ -143,6 +143,55 @@ def merge_tools(
     return list(all_tools.values())
 
 
+# @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — ordered, collision-safe merge of
+# two already-converted OpenAI tool lists. Unlike merge_tools() above, this
+# helper takes two pre-converted dict lists and preserves client ordering
+# (user tools appear first, then non-colliding MCP tools in their original
+# order). User tools win on name collision.
+def merge_tool_lists(
+    user_tools: list[dict[str, Any]] | None,
+    mcp_tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """
+    Merge two already-converted OpenAI tool lists with user priority.
+
+    Semantics:
+        * Client-provided tools appear first, in their original order.
+        * Non-colliding MCP tools are appended afterwards, in their original
+          order.
+        * On name collision the user-provided tool wins (the MCP version is
+          dropped from the merged output).
+
+    Args:
+        user_tools: Client-provided tools in OpenAI format. May be None.
+        mcp_tools: MCP-derived tools in OpenAI format. May be None.
+
+    Returns:
+        A new list combining both inputs per the semantics above. Never
+        returns None; returns an empty list when both inputs are empty.
+    """
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    if user_tools:
+        for tool in user_tools:
+            func = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = func.get("name", "") if isinstance(func, dict) else ""
+            if name:
+                seen.add(name)
+            merged.append(tool)
+
+    if mcp_tools:
+        for tool in mcp_tools:
+            func = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = func.get("name", "") if isinstance(func, dict) else ""
+            if name and name in seen:
+                continue  # user tool already supplies this name
+            merged.append(tool)
+
+    return merged
+
+
 def extract_tool_calls(response: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extract tool calls from model response.
