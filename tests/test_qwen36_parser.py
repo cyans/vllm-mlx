@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for Qwen3.6 reasoning parser.
 
-Qwen3.6 is an instruct-tuned model that does NOT emit ``<think>`` / ``</think>``
-tags around its output by default. The parser must therefore default to routing
-streaming tokens to ``content`` unless thinking tags are explicitly observed.
+The Qwen3 chat template auto-prefills ``<think>\\n`` for the assistant
+turn, so the model's streaming output begins *inside* the thinking
+section without ever emitting an opening ``<think>`` tag itself. The
+parser must therefore default to routing streaming tokens to
+``reasoning`` (implicit-think mode) until ``</think>`` is observed; the
+chunk containing ``</think>`` splits — pre-tag to reasoning, post-tag
+to content — and any subsequent deltas pass through to content.
 
-Regression target: ``think_parser.py:140`` (Case 3 fallback) used to
-unconditionally route every pre-``</think>`` streaming token to ``reasoning``,
-which meant Qwen3.6 output was entirely invisible to tool-calling clients.
+The non-streaming :meth:`extract_reasoning` keeps the legacy
+short-circuit ("no ``</think>`` ⇒ pure content") because the full
+output is visible in one shot and a Qwen3.6 reply that never produces
+a close tag is by construction a non-thinking reply.
 
 @TEST:FIX-QWEN36-RUNTIME/parser
 """
@@ -37,15 +42,17 @@ class TestQwen36ParserRegistered:
         assert isinstance(instance, Qwen36ReasoningParser)
 
 
-class TestQwen36StreamingDefaultsToContent:
-    """Primary bug-fix assertion: plain-text streaming routes to content."""
+class TestQwen36StreamingDefaultsToReasoningInImplicitThinkMode:
+    """Primary contract: with no ``</think>`` in the stream, every delta
+    routes to ``reasoning`` (implicit-think mode)."""
 
-    def test_streaming_defaults_to_content(self) -> None:
-        # REQ-U3 (core fix): when Qwen3.6 streams plain text tokens with no
-        # ``<think>`` / ``</think>`` tags present, each DeltaMessage must
-        # carry ``content`` (not ``reasoning``). Prior to the fix the
-        # BaseThinkingReasoningParser Case 3 fallback routed everything to
-        # reasoning, hiding the output from non-reasoning-aware clients.
+    def test_streaming_defaults_to_reasoning_in_implicit_think_mode(self) -> None:
+        # REQ-U3: the Qwen3 chat template prefills ``<think>\n``, so the
+        # streaming output begins inside the thinking section. Until
+        # ``</think>`` is observed each DeltaMessage must carry
+        # ``reasoning`` (not ``content``). If ``</think>`` never arrives,
+        # everything stays in reasoning — the streaming path cannot
+        # decide retroactively that the reply was non-thinking.
         from vllm_mlx.reasoning import Qwen36ReasoningParser
 
         parser = Qwen36ReasoningParser()
@@ -61,18 +68,18 @@ class TestQwen36StreamingDefaultsToContent:
             assert msg is not None, f"parser dropped delta {delta!r}"
             results.append(msg)
 
-        # Every chunk must be content, never reasoning.
+        # Every chunk must be reasoning, never content.
         for msg, delta in zip(results, deltas, strict=True):
-            assert msg.content == delta, (
-                f"expected content={delta!r}, got content={msg.content!r}"
+            assert msg.reasoning == delta, (
+                f"expected reasoning={delta!r}, got reasoning={msg.reasoning!r}"
             )
-            assert msg.reasoning is None, (
-                f"Qwen3.6 plain text must not be routed to reasoning; "
-                f"got reasoning={msg.reasoning!r} for delta={delta!r}"
+            assert msg.content in (None, ""), (
+                f"Qwen3.6 implicit-think output must not be routed to "
+                f"content; got content={msg.content!r} for delta={delta!r}"
             )
 
         # Full reconstruction must match input.
-        reconstructed = "".join(msg.content or "" for msg in results)
+        reconstructed = "".join(msg.reasoning or "" for msg in results)
         assert reconstructed == "".join(deltas)
 
 
@@ -151,25 +158,26 @@ class TestQwen36StreamingImplicitMode:
     """
 
     def test_streaming_implicit_think_mode(self) -> None:
-        # Matches the Qwen3.5 OpenCode-compat behaviour: once ``</think>``
-        # appears in ``current_text``, content after it routes to the
-        # content channel. The chunk BEFORE ``</think>`` still routes to
-        # content for Qwen3.6 (our Case 3 divergence) — then the
-        # transition chunk splits correctly via the implicit handler.
+        # The Qwen3 chat template prefilled ``<think>\n``, so until
+        # ``</think>`` is observed deltas route to reasoning. The
+        # transition chunk that contains ``</think>`` splits — pre-tag
+        # text to reasoning, post-tag text to content — matching the
+        # non-streaming :meth:`extract_reasoning` behaviour.
         from vllm_mlx.reasoning import Qwen36ReasoningParser
 
         parser = Qwen36ReasoningParser()
         parser.reset_state()
 
-        # First chunk: no tags yet — goes to content (Qwen3.6 default).
+        # First chunk: no </think> yet — goes to reasoning (implicit
+        # think mode).
         msg1 = parser.extract_reasoning_streaming("", "reasoning", "reasoning")
         assert msg1 is not None
-        assert msg1.content == "reasoning"
-        assert msg1.reasoning is None
+        assert msg1.reasoning == "reasoning"
+        assert msg1.content in (None, "")
 
         # Second chunk: contains </think> + content. The implicit handler
         # routes the pre-</think> text to reasoning and post-</think> to
-        # content, matching the Qwen3.5 parser behaviour.
+        # content.
         msg2 = parser.extract_reasoning_streaming(
             "reasoning", "reasoning</think>answer", "</think>answer"
         )
