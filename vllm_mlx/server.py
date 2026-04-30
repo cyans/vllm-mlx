@@ -166,6 +166,16 @@ _auth_warning_logged: bool = False
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
 
+# @CODE:LEGACY-THINK-TAGS/server — opt-in legacy-client compatibility shim.
+# When True, reasoning content is re-emitted inline in the regular ``content``
+# channel wrapped in ``<think>...</think>`` (both streaming and non-streaming),
+# and the OpenAI ``reasoning`` / ``reasoning_content`` fields are forced to
+# None. This lets clients that ignore the ``reasoning`` channel (notably the
+# Obsidian MoAI plugin's ``<think>`` regex filter) hide thinking content
+# without server-side or client-side code changes. Default OFF preserves the
+# conformant OpenAI streaming contract for all other clients.
+_legacy_think_tags: bool = False
+
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
@@ -1540,6 +1550,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             text_to_parse
         )
 
+    # @CODE:LEGACY-THINK-TAGS/server-nonstream — when the legacy-tag shim is
+    # enabled and we extracted reasoning, fold it back into ``cleaned_text``
+    # as an inline ``<think>...</think>`` block and clear ``reasoning_text``.
+    # The downstream ``AssistantMessage(content=..., reasoning=None, ...)``
+    # then renders correctly for legacy clients while the OpenAI-conformant
+    # ``reasoning`` / ``reasoning_content`` channel stays empty.
+    if _legacy_think_tags and reasoning_text:
+        cleaned_text = (
+            f"<think>\n{reasoning_text}\n</think>\n{cleaned_text or ''}"
+        )
+        reasoning_text = None
+
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
         json_input = cleaned_text or output.text
@@ -2185,6 +2207,15 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # @CODE:LEGACY-THINK-TAGS/server-stream — per-stream state for the
+    # legacy-tag rewrite. ``legacy_think_started`` flips True when we emit
+    # the opening ``<think>\n`` marker (on the first reasoning delta);
+    # ``legacy_think_ended`` flips True when we emit the closing
+    # ``</think>\n`` marker (on the first content delta after thinking, or
+    # at stream end if the model never produced any post-thinking content).
+    legacy_think_started = False
+    legacy_think_ended = False
+
     # Tool call streaming state
     # @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — shared state across both
     # the reasoning-parser branch and the plain-text branch so the post-stream
@@ -2288,6 +2319,36 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json()}\n\n"
             continue
 
+        # @CODE:LEGACY-THINK-TAGS/server-stream — when the legacy-tag shim is
+        # enabled, rewrite the ``chained`` delta so that reasoning text is
+        # folded into the ``content`` channel wrapped in ``<think>...</think>``
+        # and the ``reasoning`` channel is forced to None. Done BEFORE chunk
+        # construction so both the tool_calls branch and the regular content
+        # branch get consistent treatment.
+        delta_content_legacy: str | None
+        delta_reasoning_legacy: str | None
+        if _legacy_think_tags:
+            reasoning_part = chained.reasoning
+            content_part = chained.content
+            merged_parts: list[str] = []
+            if reasoning_part:
+                if not legacy_think_started:
+                    merged_parts.append("<think>\n")
+                    legacy_think_started = True
+                merged_parts.append(reasoning_part)
+            if content_part:
+                if legacy_think_started and not legacy_think_ended:
+                    merged_parts.append("</think>\n")
+                    legacy_think_ended = True
+                merged_parts.append(content_part)
+            delta_content_legacy = "".join(merged_parts) if merged_parts else None
+            delta_reasoning_legacy = None
+        else:
+            delta_content_legacy = (
+                chained.content if chained.content else None
+            )
+            delta_reasoning_legacy = chained.reasoning
+
         if chained.tool_calls:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2295,8 +2356,11 @@ async def stream_chat_completion(
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
+                            content=delta_content_legacy
+                            if _legacy_think_tags
+                            else None,
                             tool_calls=chained.tool_calls,
-                            reasoning=chained.reasoning,
+                            reasoning=delta_reasoning_legacy,
                         ),
                         finish_reason=(
                             "tool_calls" if output.finished else None
@@ -2319,8 +2383,8 @@ async def stream_chat_completion(
             choices=[
                 ChatCompletionChunkChoice(
                     delta=ChatCompletionChunkDelta(
-                        content=chained.content if chained.content else None,
-                        reasoning=chained.reasoning,
+                        content=delta_content_legacy,
+                        reasoning=delta_reasoning_legacy,
                     ),
                     finish_reason=finish_reason,
                 )
@@ -2328,6 +2392,29 @@ async def stream_chat_completion(
             usage=get_usage(output) if output.finished else None,
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # @CODE:LEGACY-THINK-TAGS/server-stream — synthesize a closing
+    # ``</think>\n`` chunk if the stream ended while still inside a thinking
+    # block (i.e. the model produced reasoning but never any post-thinking
+    # content, so ``legacy_think_ended`` was never flipped). Without this
+    # the legacy client would render an unclosed ``<think>`` tag and fail to
+    # hide the thinking content.
+    if (
+        _legacy_think_tags
+        and legacy_think_started
+        and not legacy_think_ended
+    ):
+        legacy_think_ended = True
+        closing_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content="</think>\n"),
+                )
+            ],
+        )
+        yield f"data: {closing_chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
     # (e.g., </tool_call> never arrived - incomplete tool call)

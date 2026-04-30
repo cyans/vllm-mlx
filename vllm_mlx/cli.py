@@ -152,6 +152,22 @@ def serve_command(args):
     server._auto_inject_mcp_tools = bool(args.auto_inject_mcp_tools)
     server._log_mcp_auto_inject_status(server._auto_inject_mcp_tools)
 
+    # @CODE:LEGACY-THINK-TAGS/cli — propagate the resolved flag (CLI arg OR
+    # env var fallback) to the server module's single source of truth.
+    from .config.models import resolve_legacy_think_tags
+
+    legacy_think_tags = resolve_legacy_think_tags(
+        cli_flag=bool(args.legacy_think_tags),
+        env=os.environ,
+    )
+    server._legacy_think_tags = legacy_think_tags
+    if legacy_think_tags:
+        logger.info(
+            "Legacy <think>...</think> tag rewrite ENABLED "
+            "(reasoning channel routed into content channel for "
+            "legacy-client compatibility)."
+        )
+
     # Pre-load embedding model if specified
     if args.embedding_model:
         print(f"Pre-loading embedding model: {args.embedding_model}")
@@ -786,6 +802,27 @@ Examples:
             "requests that do not provide their own 'tools' field. When the "
             "request already has tools, MCP tools are merged (client tools "
             "win on name collision). Default: off."
+        ),
+    )
+    # @CODE:LEGACY-THINK-TAGS/cli — opt-in legacy-client compatibility shim.
+    # When enabled, Qwen3.6 thinking content is re-emitted inline in
+    # ``delta.content`` / ``message.content`` wrapped in ``<think>...</think>``
+    # so legacy clients that ignore ``delta.reasoning`` (notably the Obsidian
+    # MoAI plugin) can hide it via their existing regex filter. Default OFF
+    # preserves the OpenAI-style ``reasoning`` / ``reasoning_content`` channel
+    # routing for conformant clients. The env var
+    # ``VLLM_MLX_LEGACY_THINK_TAGS=1`` provides a launcher-friendly fallback;
+    # the CLI flag wins when both are supplied.
+    serve_parser.add_argument(
+        "--legacy-think-tags",
+        action="store_true",
+        default=False,
+        help=(
+            "Re-emit Qwen3.6 thinking content as inline <think>...</think> "
+            "blocks in the regular content channel (instead of the OpenAI "
+            "reasoning/reasoning_content fields). For legacy clients that "
+            "ignore reasoning fields. Env fallback: "
+            "VLLM_MLX_LEGACY_THINK_TAGS=1. Default: off."
         ),
     )
     # Security options

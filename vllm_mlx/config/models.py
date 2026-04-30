@@ -296,6 +296,49 @@ def resolve_reasoning_parser(
     return REASONING_PARSER
 
 
+# @CODE:LEGACY-THINK-TAGS/resolver — legacy-client compatibility shim.
+# Some clients (notably the Obsidian MoAI plugin at the time of writing)
+# ignore OpenAI-style ``delta.reasoning`` / ``delta.reasoning_content`` and
+# render every ``delta.content`` chunk verbatim. When ``--legacy-think-tags``
+# is enabled the server re-emits Qwen3.6 thinking content inline in the
+# regular ``content`` channel wrapped in ``<think>...</think>`` so the
+# client's existing ``<think>`` regex filter can hide it. Default OFF
+# preserves bit-for-bit compat with all conformant clients.
+LEGACY_THINK_TAGS_ENV_VAR: str = "VLLM_MLX_LEGACY_THINK_TAGS"
+"""Environment-variable fallback for ``--legacy-think-tags``.
+
+Truthy values (``"1"``, ``"true"``, ``"yes"``, ``"on"`` — case-insensitive)
+enable the legacy-tag rewrite; everything else (including unset) leaves it
+disabled. The CLI flag wins when both are supplied.
+"""
+
+
+def resolve_legacy_think_tags(
+    cli_flag: bool,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return the effective ``legacy_think_tags`` setting.
+
+    Precedence (highest first):
+
+    1. ``cli_flag`` — when True, the feature is enabled regardless of env.
+       This matches the standard argparse semantics where ``--legacy-think-tags``
+       is an opt-in ``store_true`` flag.
+    2. ``env[LEGACY_THINK_TAGS_ENV_VAR]`` — truthy when value (lower-cased
+       and stripped) is one of ``"1"``, ``"true"``, ``"yes"``, ``"on"``.
+       Anything else (including empty string and unset) reads as False.
+
+    Passing ``env=None`` skips the env lookup entirely so the function is
+    trivially unit-testable without touching :data:`os.environ`.
+    """
+    if cli_flag:
+        return True
+    if env is None:
+        return False
+    raw = env.get(LEGACY_THINK_TAGS_ENV_VAR, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def matches_eos_patch(model_id: str) -> bool:
     """Return ``True`` if ``model_id`` triggers the ``<|im_end|>`` EOS patch.
 
