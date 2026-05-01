@@ -36,6 +36,12 @@ ENV_MEMORY_VAULT_DENYLIST = "MEMORY_VAULT_DENYLIST"
 ENV_MEMORY_VAULT_ALLOWLIST = "MEMORY_VAULT_ALLOWLIST"
 ENV_MEMORY_TOP_K_DEFAULT = "MEMORY_TOP_K_DEFAULT"
 ENV_MEMORY_TOP_K_MAX = "MEMORY_TOP_K_MAX"
+# Phase 2 — embeddings + hybrid search (SPEC-MEMORY-01 §9)
+ENV_MEMORY_EMBED_MODEL = "MEMORY_EMBED_MODEL"
+ENV_MEMORY_EMBED_BATCH = "MEMORY_EMBED_BATCH"
+ENV_MEMORY_EMBED_DIM = "MEMORY_EMBED_DIM"
+ENV_MEMORY_EMBED_DISABLED = "MEMORY_EMBED_DISABLED"
+ENV_MEMORY_HYBRID_RRF_K = "MEMORY_HYBRID_RRF_K"
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +52,17 @@ MEMORY_DEFAULT_DB_PATH = "/Volumes/data/vllm-mlx-memory/memory.db"
 MEMORY_DEFAULT_DENYLIST = (".obsidian/**", "**/.trash/**", "**/Templates/**")
 MEMORY_DEFAULT_TOP_K = 5
 MEMORY_DEFAULT_TOP_K_MAX = 20
+# Phase 2 — bge-m3 multilingual XLM-RoBERTa, 1024-dim dense.
+# Default uses the upstream HF id to match SPEC §9; the server logs an
+# explicit hint to swap to ``mlx-community/bge-m3-mlx-fp16`` for the
+# pre-converted MLX weights when load fails (REQ-O3 fallback).
+MEMORY_DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+MEMORY_DEFAULT_EMBED_BATCH = 16
+MEMORY_DEFAULT_EMBED_DIM = 1024
+# Reciprocal-rank-fusion constant (Cormack et al. 2009). 60 is the
+# canonical value from the original RRF paper; tuned higher to soften
+# the contribution of low-rank items.
+MEMORY_DEFAULT_HYBRID_RRF_K = 60
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -67,6 +84,12 @@ class MemoryRuntimeConfig:
     allowlist: tuple[str, ...] = ()
     top_k_default: int = MEMORY_DEFAULT_TOP_K
     top_k_max: int = MEMORY_DEFAULT_TOP_K_MAX
+    # Phase 2 — embeddings + hybrid search.
+    embed_model: str = MEMORY_DEFAULT_EMBED_MODEL
+    embed_batch: int = MEMORY_DEFAULT_EMBED_BATCH
+    embed_dim: int = MEMORY_DEFAULT_EMBED_DIM
+    embed_disabled: bool = False
+    hybrid_rrf_k: int = MEMORY_DEFAULT_HYBRID_RRF_K
     # Raw env snapshot retained for diagnostic logging only — never used
     # to drive logic.
     raw_env: Mapping[str, str] = field(default_factory=dict)
@@ -146,6 +169,25 @@ def resolve_memory_config(
     top_k_max = max(1, min(top_k_max, MEMORY_DEFAULT_TOP_K_MAX))
     top_k_default = max(1, min(top_k_default, top_k_max))
 
+    # Phase 2 knobs. Each keeps a sane default when the env var is missing
+    # or malformed; embed_disabled defaults to False so the dense path is
+    # attempted whenever memory itself is enabled.
+    embed_model = (env.get(ENV_MEMORY_EMBED_MODEL) or "").strip() \
+        or MEMORY_DEFAULT_EMBED_MODEL
+    embed_batch = max(
+        1, _int_or_default(env.get(ENV_MEMORY_EMBED_BATCH), MEMORY_DEFAULT_EMBED_BATCH)
+    )
+    embed_dim = max(
+        1, _int_or_default(env.get(ENV_MEMORY_EMBED_DIM), MEMORY_DEFAULT_EMBED_DIM)
+    )
+    embed_disabled = _truthy(env.get(ENV_MEMORY_EMBED_DISABLED))
+    hybrid_rrf_k = max(
+        1,
+        _int_or_default(
+            env.get(ENV_MEMORY_HYBRID_RRF_K), MEMORY_DEFAULT_HYBRID_RRF_K
+        ),
+    )
+
     return MemoryRuntimeConfig(
         enabled=enabled,
         vault_path=vault_path,
@@ -154,6 +196,11 @@ def resolve_memory_config(
         allowlist=allow,
         top_k_default=top_k_default,
         top_k_max=top_k_max,
+        embed_model=embed_model,
+        embed_batch=embed_batch,
+        embed_dim=embed_dim,
+        embed_disabled=embed_disabled,
+        hybrid_rrf_k=hybrid_rrf_k,
         raw_env={k: v for k, v in env.items() if k.startswith("MEMORY_")},
     )
 

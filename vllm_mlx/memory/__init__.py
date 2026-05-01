@@ -18,14 +18,22 @@ from __future__ import annotations
 
 from .config import (
     MEMORY_DEFAULT_DB_PATH,
+    MEMORY_DEFAULT_EMBED_DIM,
+    MEMORY_DEFAULT_EMBED_MODEL,
     MEMORY_DEFAULT_VAULT_PATH,
     MemoryRuntimeConfig,
     resolve_memory_config,
 )
+from .embedder import Embedder, pack_float32, unpack_float32
 
 __all__ = [
     "MEMORY_DEFAULT_DB_PATH",
+    "MEMORY_DEFAULT_EMBED_DIM",
+    "MEMORY_DEFAULT_EMBED_MODEL",
     "MEMORY_DEFAULT_VAULT_PATH",
+    "Embedder",
     "MemoryRuntimeConfig",
+    "pack_float32",
     "resolve_memory_config",
+    "unpack_float32",
 ]

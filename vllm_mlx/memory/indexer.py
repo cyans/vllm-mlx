@@ -30,6 +30,23 @@ from .store import MemoryStore, chunk_id_for, file_sha256
 logger = logging.getLogger(__name__)
 
 
+# Phase 2 — keep the embedder type loose so this module never imports
+# mlx-embeddings at indexing time when the dense path is disabled.
+# ``Embedder | None`` is what callers actually pass.
+class _SupportsEmbed:  # pragma: no cover - protocol-only sentinel
+    """Structural type the indexer expects of any embedder argument.
+
+    We use a small protocol-shaped class instead of typing.Protocol so
+    Python 3.10 imports do not pay for ``runtime_checkable`` here.
+    """
+
+    def encode_batch(self, texts: list[str]) -> list[bytes]:
+        ...  # pragma: no cover
+
+    def available(self) -> bool:
+        ...  # pragma: no cover
+
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
@@ -205,6 +222,8 @@ class VaultIndexer:
         vault_root: Path,
         denylist: tuple[str, ...] = (),
         allowlist: tuple[str, ...] = (),
+        embedder: _SupportsEmbed | None = None,
+        embed_disabled: bool = False,
     ):
         self.store = store
         # Resolve symlinks on the root once so per-file resolves can be
@@ -212,6 +231,11 @@ class VaultIndexer:
         self.vault_root = vault_root.expanduser().resolve()
         self.denylist = denylist
         self.allowlist = allowlist
+        # Phase 2 — optional dense indexing. The indexer keeps working
+        # when this is None, when the embedder load fails, or when the
+        # operator sets MEMORY_EMBED_DISABLED=1.
+        self.embedder = embedder
+        self.embed_disabled = bool(embed_disabled)
 
     # -- public API ---------------------------------------------------------
 
@@ -293,6 +317,11 @@ class VaultIndexer:
                         chunks=stamped,
                     )
                     chunks_written += inserted
+                    # Phase 2 — embed the freshly written chunks inline
+                    # while the chunk_id rows are still in this txn.
+                    # Failures are logged but do not abort the txn:
+                    # BM25 + the file row remain consistent.
+                    self._embed_chunks_safely(stamped)
                 files_indexed += 1
 
                 if files_indexed % COMMIT_EVERY_FILES == 0:
@@ -326,6 +355,57 @@ class VaultIndexer:
         return stats
 
     # -- internals ----------------------------------------------------------
+
+    def _embed_chunks_safely(self, stamped: list[dict[str, object]]) -> None:
+        """Best-effort dense indexing for a batch of just-inserted chunks.
+
+        Skips silently when the dense path is unavailable (no embedder,
+        embedder failed to load, MEMORY_EMBED_DISABLED=1, or sqlite-vec
+        not loaded on the store). REQ-N4: any exception is logged and
+        swallowed so the BM25 index stays consistent with vault_files.
+        """
+        if self.embed_disabled:
+            return
+        if self.embedder is None:
+            return
+        if not getattr(self.store, "vec_loaded", False):
+            return
+        # We do not call ``.available()`` first because it returns False
+        # before the very first ``.load()`` call. The embedder itself
+        # short-circuits subsequent calls after a failed load.
+
+        try:
+            texts = [str(c["text"]) for c in stamped]
+            blobs = self.embedder.encode_batch(texts)
+        except Exception:  # noqa: BLE001 - REQ-N4
+            logger.exception(
+                "[memory] embedding failed for %d chunks; BM25 still wrote",
+                len(stamped),
+            )
+            return
+        if len(blobs) != len(stamped):
+            # Embedder degraded mid-batch (returned []). Skip vector
+            # writes for this file; backfill will pick them up later.
+            if blobs:
+                logger.warning(
+                    "[memory] embedder returned %d/%d vectors for batch; "
+                    "skipping vector insert (backfill required)",
+                    len(blobs),
+                    len(stamped),
+                )
+            return
+        try:
+            self.store.insert_vectors_batch(
+                rows=zip(
+                    (str(c["chunk_id"]) for c in stamped),
+                    blobs,
+                ),
+                source_type="vault",
+            )
+        except Exception:  # noqa: BLE001 - REQ-N4
+            logger.exception(
+                "[memory] vector insert failed for %d chunks", len(stamped)
+            )
 
     def _walk(self) -> Iterable[Path]:
         """Yield every ``*.md`` candidate under the vault root.

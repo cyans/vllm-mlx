@@ -128,6 +128,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
 );
 """
 
+# Phase 2 — sqlite-vec virtual table SQL is templated because the embedding
+# dimension is config-driven (default 1024 for bge-m3). The CREATE is
+# emitted only if the extension successfully loads on this connection.
+# We use ``chunk_id`` as a TEXT primary key so the same identifier
+# threads through ``vault_chunks``, ``fts_chunks``, and ``vec_chunks``;
+# this is the same scheme the FTS5 table uses today.
+_VEC_TABLE_SQL_TEMPLATE = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0("
+    "chunk_id TEXT PRIMARY KEY, embedding float[{dim}], +source_type TEXT)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Result row
@@ -177,11 +188,22 @@ def file_sha256(path: Path) -> str:
 class MemoryStore:
     """Thin wrapper around a SQLite connection with WAL + the SPEC schema."""
 
-    def __init__(self, db_path: Path | str):
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        embed_dim: int = 1024,
+    ):
         self.db_path = Path(db_path)
+        self.embed_dim = int(embed_dim)
         # Note: connection is opened lazily so an offline check (db_path
         # parent missing) does not raise at construction time.
         self._conn: sqlite3.Connection | None = None
+        # ``True`` after sqlite-vec successfully attached to this
+        # connection AND the ``vec_chunks`` virtual table was created
+        # (or already existed). Methods that touch vec_chunks first
+        # check this flag and degrade gracefully when False (REQ-O3).
+        self._vec_loaded: bool = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -214,6 +236,9 @@ class MemoryStore:
             "PRAGMA temp_store=MEMORY;\n"
         )
         self._conn.executescript(_SCHEMA_SQL)
+        # Try to load sqlite-vec. Failure is degraded-but-functional:
+        # BM25 still works (REQ-O3), the chat path is unaffected.
+        self._try_load_sqlite_vec()
         self._init_meta()
 
     def close(self) -> None:
@@ -265,6 +290,316 @@ class MemoryStore:
                 f"code={SCHEMA_VERSION}. Run `vllm-mlx memory rebuild` to "
                 f"recreate the database (CLI lands in Phase 3)."
             )
+
+    # -- sqlite-vec --------------------------------------------------------
+    def _try_load_sqlite_vec(self) -> None:
+        """Attempt to load the sqlite-vec extension and create vec_chunks.
+
+        Sets :attr:`_vec_loaded` to True on success. On failure the flag
+        stays False and the caller's dense path will be skipped (REQ-O3
+        fallback to BM25). Both the import and the load are wrapped so
+        a missing dylib, a mismatched SQLite, or a permission failure
+        all result in the same "no vector path" degradation.
+        """
+        if self._conn is None:
+            return
+        try:
+            import sqlite_vec  # noqa: PLC0415 - intentional lazy import
+        except Exception:  # noqa: BLE001 - REQ-O3
+            logger.warning(
+                "[memory] sqlite-vec is not installed; dense search disabled "
+                "(BM25 still works). Install with: pip install sqlite-vec"
+            )
+            return
+        try:
+            self._conn.enable_load_extension(True)
+            try:
+                sqlite_vec.load(self._conn)
+            finally:
+                # Always re-disable extension loading after the call so
+                # an attacker who later compromises the DB cannot pivot
+                # via load_extension(). REQ-N4 belt-and-braces.
+                self._conn.enable_load_extension(False)
+            # Create the vec0 virtual table at our configured dim.
+            self._conn.executescript(
+                _VEC_TABLE_SQL_TEMPLATE.format(dim=self.embed_dim)
+            )
+            self._vec_loaded = True
+            logger.info(
+                "[memory] sqlite-vec loaded; vec_chunks ready (dim=%d)",
+                self.embed_dim,
+            )
+        except Exception:  # noqa: BLE001 - REQ-O3
+            logger.exception(
+                "[memory] failed to enable sqlite-vec on this connection; "
+                "dense search disabled (BM25 still works)"
+            )
+            self._vec_loaded = False
+
+    @property
+    def vec_loaded(self) -> bool:
+        """True iff dense search via sqlite-vec is available on this conn."""
+        return self._vec_loaded
+
+    def assert_embed_compat(
+        self, *, model: str, dim: int
+    ) -> tuple[bool, str | None]:
+        """Verify the embedding model+dim match what's already in the DB.
+
+        REQ-U4: "Mixing models in one DB is forbidden." On the *first*
+        embedding write the model + dim are recorded in ``meta``; on
+        every subsequent open/write the caller must check compatibility.
+
+        Returns ``(ok, reason)``. If ``ok`` is False the caller should
+        disable the embedder for this DB. ``reason`` carries a human-
+        readable hint for log messages.
+        """
+        recorded_model = self.get_meta("embedding_model")
+        recorded_dim = self.get_meta("embedding_dim")
+
+        if recorded_model is None and recorded_dim is None:
+            # First-write case: caller will set these via
+            # ``record_embedding_identity`` after the first INSERT.
+            return True, None
+
+        if recorded_model != model:
+            return False, (
+                f"DB was indexed with model={recorded_model!r} but "
+                f"current MEMORY_EMBED_MODEL={model!r}. Run "
+                f"`python -m vllm_mlx.memory.backfill --force-rebuild` "
+                f"after wiping vec_chunks to switch models."
+            )
+        if recorded_dim is not None and int(recorded_dim) != int(dim):
+            return False, (
+                f"DB was indexed at dim={recorded_dim} but current "
+                f"MEMORY_EMBED_DIM={dim}. Backfill --force-rebuild to "
+                f"recreate vec_chunks at the new dim."
+            )
+        return True, None
+
+    def record_embedding_identity(self, *, model: str, dim: int) -> None:
+        """Persist the embedding model + dim if not already recorded.
+
+        Idempotent on subsequent calls. The store does not auto-update
+        a previously recorded value — REQ-U4 forbids mixing models so a
+        change requires explicit operator action (drop the table or
+        rebuild).
+        """
+        if self.get_meta("embedding_model") is None:
+            self.set_meta("embedding_model", str(model))
+        if self.get_meta("embedding_dim") is None:
+            self.set_meta("embedding_dim", str(int(dim)))
+
+    # -- vector writes -----------------------------------------------------
+
+    def insert_vector(
+        self,
+        *,
+        chunk_id: str,
+        embedding: bytes,
+        source_type: str = "vault",
+    ) -> bool:
+        """Insert (or replace) a single embedding for ``chunk_id``.
+
+        Returns True on success, False if the dense path is unavailable
+        on this connection. Errors during the actual INSERT are not
+        swallowed — they propagate so the caller's transaction rolls
+        back, mirroring the behaviour of ``replace_chunks_for_file``.
+
+        ``vec0`` does not support ``INSERT OR REPLACE`` directly (it
+        rejects the SQLite ``REPLACE`` conflict resolution path), so
+        we DELETE-then-INSERT to make the operation idempotent.
+        """
+        if not self._vec_loaded:
+            return False
+        self.conn.execute(
+            "DELETE FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)
+        )
+        self.conn.execute(
+            "INSERT INTO vec_chunks(chunk_id, embedding, source_type) "
+            "VALUES(?, ?, ?)",
+            (chunk_id, embedding, source_type),
+        )
+        return True
+
+    def insert_vectors_batch(
+        self,
+        *,
+        rows: Iterable[tuple[str, bytes]],
+        source_type: str = "vault",
+    ) -> int:
+        """Bulk-insert ``(chunk_id, embedding_bytes)`` pairs. Returns count.
+
+        See :meth:`insert_vector` for why we DELETE-then-INSERT instead
+        of using ``INSERT OR REPLACE``.
+        """
+        if not self._vec_loaded:
+            return 0
+        n = 0
+        for chunk_id, blob in rows:
+            self.conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id = ?", (chunk_id,)
+            )
+            self.conn.execute(
+                "INSERT INTO vec_chunks(chunk_id, embedding, source_type) "
+                "VALUES(?, ?, ?)",
+                (chunk_id, blob, source_type),
+            )
+            n += 1
+        return n
+
+    def delete_vectors_for_chunks(self, chunk_ids: Iterable[str]) -> int:
+        """Remove vector rows whose chunk_id is in the supplied iterable.
+
+        Returns the number of rows actually deleted. No-op when the
+        vec extension failed to load.
+        """
+        if not self._vec_loaded:
+            return 0
+        n = 0
+        for cid in chunk_ids:
+            cur = self.conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+            )
+            # ``rowcount`` is 1 iff the row existed.
+            n += max(0, cur.rowcount or 0)
+        return n
+
+    # -- vector reads ------------------------------------------------------
+
+    def search_dense(
+        self,
+        query_embedding: bytes,
+        *,
+        top_k: int = 5,
+        source_filter: str | None = None,
+    ) -> list[SearchHit]:
+        """Run a dense vector search against ``vec_chunks``.
+
+        ``query_embedding`` is the float32-packed bytes blob produced
+        by :func:`vllm_mlx.memory.embedder.pack_float32`. Returns a
+        list of :class:`SearchHit` ranked by ascending L2 distance
+        (closer = better). For normalized embeddings (which bge-m3
+        produces) L2² = 2(1 - cos_sim), so this ranking is equivalent
+        to cosine similarity ranking.
+
+        We map the (unbounded) L2 distance back into a positive
+        ``[0, 1]`` score for REQ-U3 via ``1 / (1 + distance)``.
+
+        ``sqlite-vec`` rejects WHERE constraints on auxiliary columns
+        inside a KNN query, so when a ``source_filter`` is supplied
+        we over-fetch by 4× and post-filter in Python. This still
+        returns ``top_k`` items in the typical case where the vault
+        dominates the index.
+        """
+        if not self._vec_loaded:
+            return []
+        if not query_embedding:
+            return []
+
+        top_k = max(1, int(top_k))
+        # vec0 requires the ``k = ?`` constraint OR ``LIMIT`` directly
+        # on the virtual table; ``k = ?`` is the documented form and
+        # works regardless of JOINs above it.
+        knn_k = top_k * 4 if (source_filter and source_filter != "both") else top_k
+
+        # ``vec_chunks`` is the source-of-truth for "which embeddings
+        # exist"; we LEFT JOIN ``vault_chunks`` so a vector with no
+        # surviving metadata row (should not happen, but defensive) is
+        # still emitted with a synthetic excerpt instead of crashing.
+        sql = (
+            "SELECT v.chunk_id, v.source_type, v.distance, "
+            "       vc.text       AS vault_text, "
+            "       vc.timestamp  AS vault_ts, "
+            "       vf.path       AS vault_path "
+            "FROM vec_chunks v "
+            "LEFT JOIN vault_chunks vc ON vc.chunk_id = v.chunk_id "
+            "LEFT JOIN vault_files vf ON vf.file_id = vc.file_id "
+            "WHERE v.embedding MATCH ? AND k = ? "
+            "ORDER BY v.distance"
+        )
+        rows = self.conn.execute(sql, (query_embedding, int(knn_k))).fetchall()
+
+        wanted: str | None = None
+        if source_filter and source_filter != "both":
+            wanted = source_filter
+
+        hits: list[SearchHit] = []
+        for r in rows:
+            stype = r["source_type"] or "vault"
+            if wanted is not None and stype != wanted:
+                continue
+            text = r["vault_text"] or ""
+            excerpt = text[:500]
+            hits.append(
+                SearchHit(
+                    chunk_id=r["chunk_id"],
+                    source_type=stype,
+                    source_path=r["vault_path"] or "",
+                    timestamp=r["vault_ts"] or "",
+                    score=_distance_to_unit(r["distance"]),
+                    excerpt=excerpt,
+                )
+            )
+            if len(hits) >= top_k:
+                break
+        return hits
+
+    def count_vectors(self) -> int:
+        """Return the number of rows in ``vec_chunks`` (0 if disabled)."""
+        if not self._vec_loaded:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM vec_chunks"
+        ).fetchone()
+        return int(row["c"])
+
+    def count_chunks_missing_vectors(self) -> int:
+        """How many ``vault_chunks`` rows still need an embedding.
+
+        Used at server startup to print a one-line backfill hint when
+        Phase-1 data is loaded into a Phase-2 binary.
+        """
+        if not self._vec_loaded:
+            # Without sqlite-vec we cannot meaningfully report missing
+            # vectors; the answer is "all of them, but you cannot
+            # backfill anyway".
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM vault_chunks "
+            "WHERE chunk_id NOT IN (SELECT chunk_id FROM vec_chunks)"
+        ).fetchone()
+        return int(row["c"])
+
+    def iter_chunks_missing_vectors(
+        self, *, batch_size: int = 100
+    ) -> Iterator[list[tuple[str, str]]]:
+        """Yield batches of (chunk_id, text) pairs that lack an embedding.
+
+        Used by the backfill job. The cursor is paged so a long-running
+        backfill can be killed and resumed without rescanning. Pagination
+        uses ``chunk_id`` ordering to be deterministic.
+
+        When sqlite-vec is unavailable this generator is empty so the
+        backfill becomes a no-op.
+        """
+        if not self._vec_loaded:
+            return
+        last_id = ""
+        while True:
+            rows = self.conn.execute(
+                "SELECT chunk_id, text FROM vault_chunks "
+                "WHERE chunk_id > ? "
+                "  AND chunk_id NOT IN (SELECT chunk_id FROM vec_chunks) "
+                "ORDER BY chunk_id "
+                "LIMIT ?",
+                (last_id, int(batch_size)),
+            ).fetchall()
+            if not rows:
+                return
+            yield [(r["chunk_id"], r["text"]) for r in rows]
+            last_id = rows[-1]["chunk_id"]
+
 
     def get_meta(self, key: str) -> str | None:
         row = self.conn.execute(
@@ -500,6 +835,30 @@ def _normalize_fts5_query(query: str) -> str:
     return " ".join(tokens)
 
 
+def _distance_to_unit(distance: float | None) -> float:
+    """Map sqlite-vec L2 distance into REQ-U3's positive ``[0, 1]`` score.
+
+    bge-m3's ``text_embeds`` are L2-normalized; for two unit vectors
+    ``L2_distance² = 2 * (1 - cos_sim)`` so the L2 distance ranges in
+    ``[0, 2]`` for "perfect match" → "antipodal". We squash via
+    ``1 / (1 + distance)`` so:
+
+    - distance 0.0 (perfect match)   → 1.00
+    - distance 0.5 (close)           → 0.67
+    - distance ~1.0 (orthogonal)     → 0.50
+    - distance ~1.41 (cos -0.5)      → 0.41
+    - distance 2.0 (opposite)        → 0.33
+
+    The ``[0, 1]`` shape matters for the envelope contract; the exact
+    curve does not — RRF re-ranks by *position*, not score, so the
+    scores serve only as a human-readable hint downstream.
+    """
+    if distance is None:
+        return 0.0
+    d = max(0.0, float(distance))
+    return 1.0 / (1.0 + d)
+
+
 def _bm25_to_unit(bm25: float | None) -> float:
     """Map FTS5 BM25 to a positive ``[0, 1]`` score (better=higher).
 
@@ -547,6 +906,22 @@ __all__ = [
     "file_sha256",
     "open_store",
 ]
+
+# Wire ``open_store`` to forward the new ``embed_dim`` kwarg too.
+def _patched_open_store(db_path: Path | str, *, embed_dim: int = 1024) -> MemoryStore:
+    """Open and initialize a store at ``db_path`` (with vec dim).
+
+    Re-defines ``open_store`` to accept the Phase-2 ``embed_dim`` kwarg
+    while staying backwards-compatible with Phase-1 callers that pass
+    only ``db_path``.
+    """
+    store = MemoryStore(db_path, embed_dim=embed_dim)
+    store.open()
+    return store
+
+
+# Replace the simple Phase-1 helper with the dim-aware version.
+open_store = _patched_open_store  # noqa: F811 - intentional override
 
 
 # Silence lints about ``json`` being unused — it is part of the public

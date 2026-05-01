@@ -33,6 +33,15 @@ from .store import MemoryStore, SearchHit
 logger = logging.getLogger("vllm_mlx.memory.server")
 
 
+# Phase 2 — keep the embedder ref loose so MCP server tests do not
+# need to import mlx-embeddings. The runtime check is a duck-typed
+# ``encode_one`` call.
+class _SupportsEmbedOne:  # pragma: no cover - protocol-only sentinel
+    def encode_one(self, text: str) -> bytes | None: ...
+    def available(self) -> bool: ...
+    def disabled(self) -> bool: ...
+
+
 # ---------------------------------------------------------------------------
 # Tool schema (REQ-U1 / SPEC §7)
 # ---------------------------------------------------------------------------
@@ -77,6 +86,7 @@ def search_memory(
     top_k: int = 5,
     source_filter: str = "both",
     config: MemoryRuntimeConfig,
+    embedder: _SupportsEmbedOne | None = None,
 ) -> dict[str, Any]:
     """Return the JSON envelope for one ``memory_search`` invocation.
 
@@ -84,8 +94,12 @@ def search_memory(
     ``{status, degraded, results}`` envelope so the model's tool-use
     loop always sees structured data.
 
-    Phase 1: only BM25 over the vault is wired up. Phase 2 will graft
-    dense + RRF on top of this same envelope shape.
+    Phase 2: hybrid BM25 + dense vector search with reciprocal-rank-
+    fusion (RRF). When ``embedder`` is None, ``config.embed_disabled``
+    is True, or sqlite-vec is not loaded on the store, falls back to
+    BM25-only. When the dense path was *attempted* but failed
+    (REQ-O3), the envelope carries ``degraded: true`` so the model
+    knows the result quality is reduced.
     """
     if not config.enabled:
         return {
@@ -122,12 +136,51 @@ def search_memory(
     if source_filter not in ("vault", "chat", "both"):
         source_filter = "both"
 
+    # We over-fetch on each leg so RRF has more candidates to fuse.
+    # 2x is a common heuristic that balances recall vs. cost.
+    leg_k = top_k * 2
+
+    # ----- BM25 leg -------------------------------------------------------
+    bm25_hits: list[SearchHit] = []
+    bm25_failed = False
     try:
-        hits: list[SearchHit] = store.search_bm25(
-            query, top_k=top_k, source_filter=source_filter
+        bm25_hits = store.search_bm25(
+            query, top_k=leg_k, source_filter=source_filter
         )
-    except Exception:  # noqa: BLE001 - REQ-N4: never crash the chat path
-        logger.exception("[memory] search failed for query=%r", query)
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception("[memory] BM25 search failed for query=%r", query)
+        bm25_failed = True
+
+    # ----- Dense leg (Phase 2) -------------------------------------------
+    dense_hits: list[SearchHit] = []
+    dense_attempted = False
+    dense_failed = False
+    if (
+        embedder is not None
+        and not config.embed_disabled
+        and getattr(store, "vec_loaded", False)
+        and not embedder.disabled()
+    ):
+        dense_attempted = True
+        try:
+            qvec = embedder.encode_one(query)
+            if qvec is None:
+                dense_failed = True
+            else:
+                dense_hits = store.search_dense(
+                    qvec, top_k=leg_k, source_filter=source_filter
+                )
+        except Exception:  # noqa: BLE001 - REQ-N4 / REQ-O3
+            logger.exception(
+                "[memory] dense search failed for query=%r — falling back "
+                "to BM25-only with degraded:true",
+                query,
+            )
+            dense_failed = True
+
+    # ----- Fusion ---------------------------------------------------------
+    # Both legs failed → no results possible; surface as error.
+    if bm25_failed and (dense_failed or not dense_attempted):
         return {
             "status": "error",
             "degraded": True,
@@ -135,9 +188,18 @@ def search_memory(
             "message": "internal search error (see server logs)",
         }
 
+    fused = _rrf_fuse(
+        bm25_hits, dense_hits, k=int(config.hybrid_rrf_k), top_k=top_k
+    )
+
+    # ``degraded`` is True iff a dense result was supposed to happen
+    # and didn't. A user who explicitly set MEMORY_EMBED_DISABLED=1
+    # gets degraded=False because BM25 is the contracted result.
+    degraded = bm25_failed or dense_failed
+
     return {
         "status": "ok",
-        "degraded": False,
+        "degraded": degraded,
         "results": [
             {
                 "source_type": h.source_type,
@@ -146,9 +208,57 @@ def search_memory(
                 "score": round(h.score, 4),
                 "excerpt": h.excerpt,
             }
-            for h in hits
+            for h in fused
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion (Cormack et al. 2009)
+# ---------------------------------------------------------------------------
+def _rrf_fuse(
+    bm25_hits: list[SearchHit],
+    dense_hits: list[SearchHit],
+    *,
+    k: int,
+    top_k: int,
+) -> list[SearchHit]:
+    """Merge two ranked lists with reciprocal-rank fusion.
+
+    For each chunk we compute ``score = sum(1 / (k + rank))`` over the
+    streams it appears in (ranks are 1-indexed). The merged list is
+    sorted by descending RRF score. When dense_hits is empty this
+    reduces to BM25 ordering; the SearchHit objects themselves are
+    taken from the BM25 stream (which carries the snippet excerpt
+    from FTS5) when both streams hit the same chunk_id, falling back
+    to the dense entry otherwise.
+
+    The original :class:`SearchHit.score` (a per-leg unit score) is
+    preserved on the returned object — it remains meaningful as a
+    "how good was the best signal for this hit" hint for the model.
+    """
+    if k < 1:
+        k = 1
+    if not bm25_hits and not dense_hits:
+        return []
+
+    # rank_score keeps the running RRF sum per chunk_id.
+    rank_score: dict[str, float] = {}
+    # representative SearchHit per chunk_id; BM25 entries win because
+    # they carry the FTS5-extracted excerpt with hit highlights.
+    rep: dict[str, SearchHit] = {}
+
+    for rank, h in enumerate(bm25_hits, start=1):
+        rank_score[h.chunk_id] = rank_score.get(h.chunk_id, 0.0) + 1.0 / (k + rank)
+        rep.setdefault(h.chunk_id, h)
+    for rank, h in enumerate(dense_hits, start=1):
+        rank_score[h.chunk_id] = rank_score.get(h.chunk_id, 0.0) + 1.0 / (k + rank)
+        # Dense hits usually carry the same chunk_id as a BM25 hit;
+        # only adopt them as the representative when BM25 missed.
+        rep.setdefault(h.chunk_id, h)
+
+    ordered = sorted(rep.values(), key=lambda h: rank_score[h.chunk_id], reverse=True)
+    return ordered[: max(1, int(top_k))]
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +288,8 @@ async def _run_mcp_stdio() -> None:
 
     # Open the store eagerly so search latency does not include init.
     store = _try_open_store(config)
+    embedder = _try_build_embedder(store, config)
+
     # Run the indexer if a real vault is reachable. Failures degrade to
     # "no vault" but still keep the MCP tool registered.
     if store is not None and config.enabled and config.vault_path.is_dir():
@@ -189,6 +301,8 @@ async def _run_mcp_stdio() -> None:
                 vault_root=config.vault_path,
                 denylist=config.denylist,
                 allowlist=config.allowlist,
+                embedder=embedder,
+                embed_disabled=config.embed_disabled,
             )
             stats = indexer.initial_scan()
             logger.info(
@@ -198,6 +312,20 @@ async def _run_mcp_stdio() -> None:
             )
         except Exception:  # noqa: BLE001 - never crash on indexer failure
             logger.exception("[memory] initial scan failed")
+
+    # If we have data from a previous run that lacks vectors, hint the
+    # operator. Phase 2 deliberately does NOT auto-backfill on startup
+    # because embedding 36k chunks can take many minutes; we want this
+    # to be an explicit, observable operation.
+    if store is not None and store.vec_loaded:
+        missing = store.count_chunks_missing_vectors()
+        if missing > 0:
+            logger.warning(
+                "[memory] %d chunks lack embeddings; run "
+                "`python -m vllm_mlx.memory.backfill` to enable dense "
+                "search over them (BM25 still works in the meantime)",
+                missing,
+            )
 
     server = Server("memory")
 
@@ -228,6 +356,7 @@ async def _run_mcp_stdio() -> None:
             top_k=int(arguments.get("top_k") or config.top_k_default),
             source_filter=str(arguments.get("source_filter") or "both"),
             config=config,
+            embedder=embedder,
         )
         return [
             types.TextContent(
@@ -255,11 +384,70 @@ def _try_open_store(config: MemoryRuntimeConfig) -> MemoryStore | None:
     if not config.enabled:
         return None
     try:
-        store = MemoryStore(config.db_path)
+        store = MemoryStore(config.db_path, embed_dim=config.embed_dim)
         store.open()
         return store
     except Exception:  # noqa: BLE001 - REQ-N4
         logger.exception("[memory] failed to open store at %s", config.db_path)
+        return None
+
+
+def _try_build_embedder(
+    store: MemoryStore | None, config: MemoryRuntimeConfig
+) -> Any | None:
+    """Construct an :class:`Embedder` if the dense path makes sense.
+
+    Returns None when:
+
+    * memory is disabled, or
+    * the store failed to open, or
+    * sqlite-vec did not load on the connection, or
+    * MEMORY_EMBED_DISABLED=1, or
+    * the DB has a recorded model that does not match the configured
+      one (REQ-U4 model-mismatch protection).
+
+    On REQ-U4 mismatch we log an actionable error and return None so
+    BM25 keeps working. The operator must run
+    ``python -m vllm_mlx.memory.backfill --force-rebuild`` to swap
+    models cleanly.
+
+    Note: this does NOT call ``Embedder.load()`` — model weights are
+    only loaded on the first encode. Failures during load are
+    swallowed by the embedder itself (REQ-O3).
+    """
+    if store is None or not config.enabled:
+        return None
+    if config.embed_disabled:
+        logger.info(
+            "[memory] MEMORY_EMBED_DISABLED=1; dense search skipped (BM25 only)"
+        )
+        return None
+    if not store.vec_loaded:
+        logger.warning(
+            "[memory] sqlite-vec unavailable on this connection; dense "
+            "search disabled. Install with: pip install sqlite-vec"
+        )
+        return None
+
+    ok, reason = store.assert_embed_compat(
+        model=config.embed_model, dim=config.embed_dim
+    )
+    if not ok:
+        logger.error("[memory] embedder disabled: %s", reason)
+        return None
+
+    try:
+        from .embedder import Embedder
+
+        embedder = Embedder.from_config(config)
+        # Record the (model, dim) we're about to use *before* the first
+        # encode call so a concurrent backfill sees the same identity.
+        store.record_embedding_identity(
+            model=config.embed_model, dim=config.embed_dim
+        )
+        return embedder
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception("[memory] failed to construct embedder; BM25 only")
         return None
 
 
