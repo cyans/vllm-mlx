@@ -243,9 +243,18 @@ class Embedder:
         # back, which simplifies callers (one-to-one shape contract).
         normalized = [t if t.strip() else " " for t in texts]
 
+        # mlx-embeddings wraps the transformers tokenizer in a
+        # ``TokenizerWrapper`` that proxies attribute reads via
+        # ``__getattr__`` but does NOT define ``__call__``. The legacy
+        # ``batch_encode_plus`` method was removed from XLM-RoBERTa-family
+        # tokenizers in transformers 5.x, so we go through the raw
+        # underlying tokenizer (``self._tokenizer._tokenizer``) and use
+        # its modern ``__call__`` API which accepts both single strings
+        # and lists of strings.
+        raw_tokenizer = getattr(self._tokenizer, "_tokenizer", self._tokenizer)
         for i in range(0, len(normalized), bs):
             batch = normalized[i : i + bs]
-            inputs = self._tokenizer.batch_encode_plus(
+            inputs = raw_tokenizer(
                 batch,
                 return_tensors="mlx",
                 padding=True,
