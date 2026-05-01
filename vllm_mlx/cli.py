@@ -168,6 +168,27 @@ def serve_command(args):
             "legacy-client compatibility)."
         )
 
+    # @CODE:MEMORY-01/cli — Phase 1 memory subsystem env-var pass-through.
+    # The launcher just logs the resolved values for operator visibility;
+    # the actual indexer + MCP server runs in a child process spawned by
+    # the MCP manager (mcp.json's ``memory`` entry). REQ-S1: when
+    # MEMORY_ENABLED is not truthy this block is silent.
+    from .memory import resolve_memory_config
+
+    memory_cfg = resolve_memory_config(os.environ)
+    server._memory_enabled = memory_cfg.enabled
+    server._memory_vault_path = str(memory_cfg.vault_path)
+    server._memory_db_path = str(memory_cfg.db_path)
+    if memory_cfg.enabled:
+        logger.info(
+            "[memory] subsystem ENABLED: vault=%s db=%s top_k_default=%d "
+            "top_k_max=%d (configure via mcp.json's 'memory' server entry)",
+            memory_cfg.vault_path,
+            memory_cfg.db_path,
+            memory_cfg.top_k_default,
+            memory_cfg.top_k_max,
+        )
+
     # Pre-load embedding model if specified
     if args.embedding_model:
         print(f"Pre-loading embedding model: {args.embedding_model}")

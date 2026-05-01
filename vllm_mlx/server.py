@@ -155,6 +155,16 @@ _mcp_executor = None
 # Default OFF preserves bit-for-bit compat with Qwen 3.5 per REQ-N2.
 _auto_inject_mcp_tools: bool = False
 
+# @CODE:MEMORY-01/server — Phase 1 memory subsystem flag. Default OFF
+# preserves REQ-S1 (bit-for-bit compat with a build without this SPEC).
+# When True, the launcher logs resolved memory paths and operators are
+# expected to enable the matching ``memory`` entry in ``mcp.json``;
+# the actual indexer + search logic lives in the spawned MCP child
+# process (vllm_mlx.memory.server), not in this FastAPI process.
+_memory_enabled: bool = False
+_memory_vault_path: str | None = None
+_memory_db_path: str | None = None
+
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
