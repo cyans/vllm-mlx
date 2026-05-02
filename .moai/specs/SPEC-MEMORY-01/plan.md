@@ -167,6 +167,41 @@ Deliverables:
 
 Effort: ~2 days.
 
+### Chunker quality (followup, landed in Phase 2)
+
+Originally scoped for Phase 4 polish, but pulled forward after the
+Phase 1+2 live smoke test exposed a concrete regression: an Obsidian
+book-style file produced ~16 chunks where roughly half were 15-30
+char header-only fragments (e.g. `## 3부 내면 근력 강화 6단계`) that
+lacked any body text. Two consequences:
+
+1. **BM25 dominance** — the tiny header-only chunks scored very high
+   on queries that matched the header words verbatim, pushing out body
+   chunks that contained the actual content.
+2. **Lost parent context for body chunks** — a body chunk like
+   `### 6장 1단계: 자기절제의 뇌과학` did not carry its umbrella
+   `## 3부 ...` header, so semantic match against `"내면 근력 강화"`
+   was weak.
+
+Fix shipped as chunker v2 (`vllm_mlx/memory/indexer.py::chunk_markdown`):
+
+- Every emitted chunk carries its full parent header path as a
+  textual prefix (`"# A > ## B > ### C\n\n<body>"`).
+- Header-only sections still emit a chunk, but the chunk's text is
+  the joined header path itself (gives BM25 enough content to score
+  fairly; gives the dense embedder umbrella context for free).
+- `meta.chunker_version` is now recorded on first scan; a mismatch at
+  startup prints one WARNING line — no auto-rebuild.
+- Operator path: `python -m vllm_mlx.memory.indexer --rebuild` wipes
+  vault tables and re-chunks from scratch; `python -m vllm_mlx.memory.backfill`
+  re-embeds afterwards. The two phases stay separate by design.
+- Tests: added 6 chunker-v2 tests + 1 fixture
+  (`tests/fixtures/vault_small/multi_level_headers.md`); coverage on
+  `indexer.py` rose to 91%, `store.py` stays at 90%.
+
+Schema_version is intentionally NOT bumped — the wire format is
+identical, only the *content* of each chunk's `text` column changed.
+
 Total rough effort: ~9 working days.
 
 ## Dependencies — additions to `pyproject.toml`
