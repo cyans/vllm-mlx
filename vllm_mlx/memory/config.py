@@ -47,6 +47,13 @@ ENV_MEMORY_CHAT_LOG_ENABLED = "MEMORY_CHAT_LOG_ENABLED"
 ENV_MEMORY_REDACT_PATTERNS = "MEMORY_REDACT_PATTERNS"
 ENV_MEMORY_CHAT_RETENTION_DAYS = "MEMORY_CHAT_RETENTION_DAYS"
 ENV_MEMORY_CHAT_EMBED_INTERVAL = "MEMORY_CHAT_EMBED_INTERVAL"
+# Phase 4 — vault watcher + retention sweeper (SPEC-MEMORY-01 §9, REQ-E2/N5)
+ENV_MEMORY_INDEXER = "MEMORY_INDEXER"
+ENV_MEMORY_WATCHER_DEBOUNCE_MS = "MEMORY_WATCHER_DEBOUNCE_MS"
+ENV_MEMORY_RETENTION_SWEEP_INTERVAL_SECONDS = (
+    "MEMORY_RETENTION_SWEEP_INTERVAL_SECONDS"
+)
+ENV_MEMORY_CHAT_RETENTION_MODE = "MEMORY_CHAT_RETENTION_MODE"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +82,26 @@ MEMORY_DEFAULT_CHAT_RETENTION_DAYS = 365
 # REQ-E4 mandates "queryable within 10 seconds" — the embed loop polls
 # every 10s by default; operators can lower this for tests.
 MEMORY_DEFAULT_CHAT_EMBED_INTERVAL = 10.0
+# Phase 4 defaults from SPEC-MEMORY-01 §9 / Phase 4 plan.
+# Indexer mode: ``watchdog`` activates the FSEvents-backed VaultWatcher.
+# Setting it to ``poll`` disables the watcher (the operator can still rely
+# on the periodic restart-time initial_scan). Any other value is treated
+# as "off" with a one-line warning so a typo cannot silently turn off
+# incremental indexing AND a typo cannot silently keep it on.
+MEMORY_DEFAULT_INDEXER = "watchdog"
+# Sub-second FSEvents fires plenty fast on macOS; 500ms gives editors that
+# rewrite via .swp+rename plenty of time to settle into the final on-disk
+# state before we re-chunk + re-embed. REQ-E2 budget is 5s end-to-end.
+MEMORY_DEFAULT_WATCHER_DEBOUNCE_MS = 500
+# Retention sweeper interval. REQ-N5 documents 365-day retention; running
+# the sweep four times a day (every 6 hours) keeps the cutoff close to
+# real time without ever holding a long write lock.
+MEMORY_DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
+# Retention mode: ``delete`` evicts the row entirely (default per SPEC §9);
+# ``redact`` keeps the row for analytics but blanks the payload AND drops
+# the FTS/vector index entries so the redacted text is never returned.
+MEMORY_DEFAULT_CHAT_RETENTION_MODE = "delete"
+MEMORY_VALID_RETENTION_MODES = frozenset({"delete", "redact"})
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -107,6 +134,13 @@ class MemoryRuntimeConfig:
     redact_patterns: tuple[str, ...] = ()
     chat_retention_days: int = MEMORY_DEFAULT_CHAT_RETENTION_DAYS
     chat_embed_interval: float = MEMORY_DEFAULT_CHAT_EMBED_INTERVAL
+    # Phase 4 — vault watcher + retention sweeper.
+    indexer: str = MEMORY_DEFAULT_INDEXER
+    watcher_debounce_ms: int = MEMORY_DEFAULT_WATCHER_DEBOUNCE_MS
+    retention_sweep_interval_seconds: int = (
+        MEMORY_DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS
+    )
+    chat_retention_mode: str = MEMORY_DEFAULT_CHAT_RETENTION_MODE
     # Raw env snapshot retained for diagnostic logging only — never used
     # to drive logic.
     raw_env: Mapping[str, str] = field(default_factory=dict)
@@ -248,6 +282,51 @@ def resolve_memory_config(
     # Clamp to >=1s so a typo cannot pin the CPU at 100%.
     chat_embed_interval = max(1.0, float(chat_embed_interval))
 
+    # Phase 4 — watcher / sweeper. We accept the raw env values then
+    # apply the same "default on bad value" pattern used elsewhere so
+    # a typo cannot disable a safety-critical loop silently.
+    indexer = (env.get(ENV_MEMORY_INDEXER) or MEMORY_DEFAULT_INDEXER).strip().lower()
+    if indexer not in ("watchdog", "poll"):
+        logger.warning(
+            "[memory] %s=%r is not 'watchdog' or 'poll'; "
+            "defaulting to %r (incremental indexer disabled)",
+            ENV_MEMORY_INDEXER,
+            indexer,
+            "poll",
+        )
+        indexer = "poll"
+
+    watcher_debounce_ms = max(
+        50,
+        _int_or_default(
+            env.get(ENV_MEMORY_WATCHER_DEBOUNCE_MS),
+            MEMORY_DEFAULT_WATCHER_DEBOUNCE_MS,
+        ),
+    )
+    retention_sweep_interval_seconds = max(
+        # 60s minimum so a typo (e.g. ``0``) cannot turn the sweep into a
+        # hot loop. The default is 6 hours; tests pass a smaller value
+        # explicitly via the constructor argument.
+        60,
+        _int_or_default(
+            env.get(ENV_MEMORY_RETENTION_SWEEP_INTERVAL_SECONDS),
+            MEMORY_DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS,
+        ),
+    )
+    chat_retention_mode = (
+        env.get(ENV_MEMORY_CHAT_RETENTION_MODE)
+        or MEMORY_DEFAULT_CHAT_RETENTION_MODE
+    ).strip().lower()
+    if chat_retention_mode not in MEMORY_VALID_RETENTION_MODES:
+        logger.warning(
+            "[memory] %s=%r is not in %s; falling back to %r",
+            ENV_MEMORY_CHAT_RETENTION_MODE,
+            chat_retention_mode,
+            sorted(MEMORY_VALID_RETENTION_MODES),
+            MEMORY_DEFAULT_CHAT_RETENTION_MODE,
+        )
+        chat_retention_mode = MEMORY_DEFAULT_CHAT_RETENTION_MODE
+
     return MemoryRuntimeConfig(
         enabled=enabled,
         vault_path=vault_path,
@@ -265,6 +344,10 @@ def resolve_memory_config(
         redact_patterns=redact_patterns,
         chat_retention_days=chat_retention_days,
         chat_embed_interval=chat_embed_interval,
+        indexer=indexer,
+        watcher_debounce_ms=watcher_debounce_ms,
+        retention_sweep_interval_seconds=retention_sweep_interval_seconds,
+        chat_retention_mode=chat_retention_mode,
         raw_env={k: v for k, v in env.items() if k.startswith("MEMORY_")},
     )
 

@@ -939,6 +939,207 @@ class MemoryStore:
         ).fetchone()
         return int(row["c"])
 
+    # -- Phase 4: vault watcher helpers ------------------------------------
+    def get_vault_file_id(self, path: str) -> int | None:
+        """Return ``file_id`` for ``path`` or ``None`` if no row exists.
+
+        Used by :class:`VaultWatcher` to translate FSEvents file paths
+        back into the primary key our chunks point at. Idempotent and
+        side-effect free.
+        """
+        row = self.conn.execute(
+            "SELECT file_id FROM vault_files WHERE path = ?", (path,)
+        ).fetchone()
+        return int(row["file_id"]) if row is not None else None
+
+    def get_chunk_ids_for_file(self, file_id: int) -> list[str]:
+        """Return every ``chunk_id`` currently attached to ``file_id``.
+
+        Used to wipe the dense + FTS rows for a file before re-chunking
+        (modify) or before deleting the file row (delete). The list is
+        stable on row order so callers can pass it back to
+        :meth:`delete_vectors_for_chunks` deterministically.
+        """
+        rows = self.conn.execute(
+            "SELECT chunk_id FROM vault_chunks WHERE file_id = ?",
+            (file_id,),
+        ).fetchall()
+        return [str(r["chunk_id"]) for r in rows]
+
+    def delete_file_and_chunks(self, file_id: int) -> int:
+        """Atomically remove every row tied to ``file_id``.
+
+        Wipes ``fts_chunks`` and ``vec_chunks`` for every chunk_id under
+        the file, then drops the ``vault_files`` row (which cascades to
+        ``vault_chunks`` via the foreign-key constraint). Returns the
+        number of chunks evicted from FTS.
+
+        Caller must wrap in a :meth:`transaction` to keep the four
+        tables consistent if any one statement fails. The watcher uses
+        this for its ``_on_deleted`` event handler.
+        """
+        chunk_ids = self.get_chunk_ids_for_file(file_id)
+        for cid in chunk_ids:
+            self.conn.execute(
+                "DELETE FROM fts_chunks WHERE chunk_id = ?", (cid,)
+            )
+        if self._vec_loaded and chunk_ids:
+            for cid in chunk_ids:
+                self.conn.execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+                )
+        # vault_chunks cascades on the FK below.
+        self.conn.execute(
+            "DELETE FROM vault_files WHERE file_id = ?", (file_id,)
+        )
+        return len(chunk_ids)
+
+    def delete_vectors_for_file(self, file_id: int) -> int:
+        """Drop every vector row whose chunk_id belongs to ``file_id``.
+
+        Used by the watcher's ``_on_modified`` flow BEFORE re-chunking,
+        so old (now-orphaned) embeddings cannot survive into the next
+        ``replace_chunks_for_file`` call. Returns the number of vector
+        rows deleted (0 when sqlite-vec is unavailable).
+        """
+        if not self._vec_loaded:
+            return 0
+        chunk_ids = self.get_chunk_ids_for_file(file_id)
+        n = 0
+        for cid in chunk_ids:
+            cur = self.conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+            )
+            n += max(0, cur.rowcount or 0)
+        return n
+
+    # -- Phase 4: retention sweeper helpers --------------------------------
+    def fetch_chat_message_ids_older_than(
+        self, *, cutoff_iso: str, limit: int
+    ) -> list[str]:
+        """Return up to ``limit`` chat ``message_id``s older than ``cutoff_iso``.
+
+        The sweeper batches via this method so a single sweep never
+        holds the WAL writer for longer than one batch.
+        """
+        rows = self.conn.execute(
+            "SELECT message_id FROM chat_messages "
+            "WHERE timestamp < ? "
+            "ORDER BY timestamp "
+            "LIMIT ?",
+            (cutoff_iso, int(limit)),
+        ).fetchall()
+        return [str(r["message_id"]) for r in rows]
+
+    def delete_chat_messages(self, message_ids: Iterable[str]) -> int:
+        """Hard-delete the listed chat rows + their FTS/vec entries.
+
+        Returns the number of ``chat_messages`` rows actually removed.
+        Caller must wrap in :meth:`transaction`. No-op on an empty input.
+        """
+        ids = [str(m) for m in message_ids]
+        if not ids:
+            return 0
+        n = 0
+        for mid in ids:
+            self.conn.execute(
+                "DELETE FROM fts_chunks WHERE chunk_id = ?", (mid,)
+            )
+            if self._vec_loaded:
+                self.conn.execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (mid,)
+                )
+            cur = self.conn.execute(
+                "DELETE FROM chat_messages WHERE message_id = ?", (mid,)
+            )
+            n += max(0, cur.rowcount or 0)
+        return n
+
+    def redact_chat_messages(
+        self, message_ids: Iterable[str], *, placeholder_payload: str
+    ) -> int:
+        """Mark the listed chat rows as redacted (REQ-N5 ``redact`` mode).
+
+        The row stays in ``chat_messages`` for analytics, but its FTS
+        and vector entries are removed so the redacted text cannot be
+        returned by ``memory_search``. Caller must wrap in
+        :meth:`transaction`.
+        """
+        ids = [str(m) for m in message_ids]
+        if not ids:
+            return 0
+        n = 0
+        for mid in ids:
+            self.conn.execute(
+                "DELETE FROM fts_chunks WHERE chunk_id = ?", (mid,)
+            )
+            if self._vec_loaded:
+                self.conn.execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (mid,)
+                )
+            cur = self.conn.execute(
+                "UPDATE chat_messages SET payload = ? "
+                "WHERE message_id = ?",
+                (placeholder_payload, mid),
+            )
+            n += max(0, cur.rowcount or 0)
+        return n
+
+    # -- Phase 4: diagnostic stats ----------------------------------------
+    def get_memory_stats(self) -> dict[str, Any]:
+        """Return a snapshot of indexed-content counts + last sweep marker.
+
+        Schema is intentionally additive so future operator dashboards
+        can read it without a code change. Fields:
+
+        * ``vault_files`` — number of files in ``vault_files``
+        * ``vault_chunks`` — total chunks in ``vault_chunks``
+        * ``chat_messages`` — total chat rows persisted
+        * ``vec_chunks`` — embeddings count (0 when sqlite-vec disabled)
+        * ``vec_loaded`` — bool, sqlite-vec status on this connection
+        * ``vec_coverage_pct`` — vec_chunks / (vault_chunks + chat_messages)
+          as percent (None when both denominators are 0)
+        * ``last_sweep_at`` — ISO8601 stamp of the last retention sweep
+          (None if the sweeper has never run on this DB)
+        * ``last_sweep_count`` — number of rows the most recent sweep
+          touched (0 if never run)
+        * ``last_sweep_mode`` — ``delete`` or ``redact`` (None if never)
+        """
+        vault_files = self.count_vault_files()
+        vault_chunks = self.count_vault_chunks()
+        chat_messages = self.count_chat_messages()
+        vec_chunks = self.count_vectors()
+
+        denom = vault_chunks + chat_messages
+        coverage_pct: float | None
+        if denom <= 0 or not self._vec_loaded:
+            coverage_pct = None
+        else:
+            coverage_pct = round(100.0 * vec_chunks / denom, 2)
+
+        last_sweep_at = self.get_meta("last_sweep_at")
+        last_sweep_count_raw = self.get_meta("last_sweep_count")
+        try:
+            last_sweep_count = (
+                int(last_sweep_count_raw)
+                if last_sweep_count_raw is not None
+                else 0
+            )
+        except (TypeError, ValueError):
+            last_sweep_count = 0
+
+        return {
+            "vault_files": vault_files,
+            "vault_chunks": vault_chunks,
+            "chat_messages": chat_messages,
+            "vec_chunks": vec_chunks,
+            "vec_loaded": bool(self._vec_loaded),
+            "vec_coverage_pct": coverage_pct,
+            "last_sweep_at": last_sweep_at,
+            "last_sweep_count": last_sweep_count,
+            "last_sweep_mode": self.get_meta("last_sweep_mode"),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Module helpers

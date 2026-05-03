@@ -62,7 +62,11 @@ dependencies = [
     "mlx-embeddings>=0.0.5",
     # SPEC-MEMORY-01 Phase 2: vector ANN over local SQLite, no daemon.
     # Pure-C MIT-licensed extension; pre-built macosx-arm64 wheel on PyPI.
-    "sqlite-vec>=0.1.6"
+    "sqlite-vec>=0.1.6",
+    # SPEC-MEMORY-01 Phase 4: FSEvents-backed vault watcher (macOS sub-second
+    # detection) and the retention sweeper. v6 ships a maintained Python 3.13
+    # wheel and drops the old PyQt observer that no one uses.
+    "watchdog>=6.0"
 ]
 
 [project.optional-dependencies]

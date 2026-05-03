@@ -383,6 +383,75 @@ async def _run_mcp_stdio() -> None:
             float(config.chat_embed_interval),
         )
 
+    # Phase 4: vault watcher. Runs alongside the chat embed loop and
+    # the retention sweeper. Gated on MEMORY_INDEXER=watchdog (the
+    # default). Failures inside the watcher loop are isolated per
+    # REQ-N4, so a flaky FSEvents subscription cannot poison the chat
+    # path.
+    if (
+        store is not None
+        and config.enabled
+        and config.vault_path.is_dir()
+        and config.indexer == "watchdog"
+    ):
+        try:
+            from .watcher import VaultWatcher  # noqa: PLC0415
+
+            watcher = VaultWatcher(
+                store,
+                vault_root=config.vault_path,
+                denylist=config.denylist,
+                allowlist=config.allowlist,
+                embedder=embedder,
+                embed_disabled=config.embed_disabled,
+                debounce_ms=int(config.watcher_debounce_ms),
+            )
+            asyncio.create_task(watcher.run())
+            logger.info(
+                "[memory] vault watcher scheduled (debounce=%dms)",
+                int(config.watcher_debounce_ms),
+            )
+        except Exception:  # noqa: BLE001 - REQ-N4
+            logger.exception(
+                "[memory] failed to schedule vault watcher; "
+                "incremental updates disabled"
+            )
+
+    # Phase 4: retention sweeper. Gated on a positive
+    # MEMORY_CHAT_RETENTION_DAYS — when zero or negative the sweep
+    # would no-op forever, so we just skip scheduling. Mode defaults
+    # to ``delete`` per SPEC §9.
+    if (
+        store is not None
+        and config.enabled
+        and config.chat_log_enabled
+        and config.chat_retention_days > 0
+    ):
+        try:
+            from .sweeper import RetentionSweeper  # noqa: PLC0415
+
+            sweeper = RetentionSweeper(
+                store,
+                retention_days=int(config.chat_retention_days),
+                mode=config.chat_retention_mode,
+                sweep_interval_seconds=float(
+                    config.retention_sweep_interval_seconds
+                ),
+            )
+            asyncio.create_task(sweeper.run())
+            logger.info(
+                "[memory] retention sweeper scheduled "
+                "(days=%d mode=%s interval=%ds)",
+                int(config.chat_retention_days),
+                config.chat_retention_mode,
+                int(config.retention_sweep_interval_seconds),
+            )
+        except Exception:  # noqa: BLE001 - REQ-N4
+            logger.exception(
+                "[memory] failed to schedule retention sweeper; "
+                "old chat rows will not be evicted automatically"
+            )
+
     server = Server("memory")
 
     @server.list_tools()
