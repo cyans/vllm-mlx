@@ -179,14 +179,25 @@ def serve_command(args):
     server._memory_enabled = memory_cfg.enabled
     server._memory_vault_path = str(memory_cfg.vault_path)
     server._memory_db_path = str(memory_cfg.db_path)
+    # @CODE:MEMORY-01/chatlog — Phase 3 chat persistence wiring.
+    server._memory_chat_log_enabled = memory_cfg.chat_log_enabled
+    if memory_cfg.chat_log_enabled:
+        from .memory.chatlog import compile_redact_patterns
+
+        server._memory_redact_patterns = compile_redact_patterns(
+            list(memory_cfg.redact_patterns) or None
+        )
     if memory_cfg.enabled:
         logger.info(
             "[memory] subsystem ENABLED: vault=%s db=%s top_k_default=%d "
-            "top_k_max=%d (configure via mcp.json's 'memory' server entry)",
+            "top_k_max=%d chat_log=%s retention_days=%d "
+            "(configure via mcp.json's 'memory' server entry)",
             memory_cfg.vault_path,
             memory_cfg.db_path,
             memory_cfg.top_k_default,
             memory_cfg.top_k_max,
+            memory_cfg.chat_log_enabled,
+            memory_cfg.chat_retention_days,
         )
 
     # Pre-load embedding model if specified

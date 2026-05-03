@@ -473,6 +473,7 @@ class MemoryStore:
         *,
         top_k: int = 5,
         source_filter: str | None = None,
+        chat_retention_cutoff_iso: str | None = None,
     ) -> list[SearchHit]:
         """Run a dense vector search against ``vec_chunks``.
 
@@ -491,6 +492,12 @@ class MemoryStore:
         we over-fetch by 4× and post-filter in Python. This still
         returns ``top_k`` items in the typical case where the vault
         dominates the index.
+
+        Phase 3: chat hits (``source_type='chat'``) are looked up via
+        :meth:`_chat_meta_for_chunk` since vault joins return NULL for
+        them. ``chat_retention_cutoff_iso`` (REQ-N5) is applied here so
+        rows older than ``MEMORY_CHAT_RETENTION_DAYS`` never escape the
+        store, even if their embeddings still exist in vec_chunks.
         """
         if not self._vec_loaded:
             return []
@@ -501,7 +508,13 @@ class MemoryStore:
         # vec0 requires the ``k = ?`` constraint OR ``LIMIT`` directly
         # on the virtual table; ``k = ?`` is the documented form and
         # works regardless of JOINs above it.
-        knn_k = top_k * 4 if (source_filter and source_filter != "both") else top_k
+        # Over-fetch when filtering OR when chat rows can be present so
+        # the post-filter retention cutoff cannot silently truncate.
+        needs_overfetch = (
+            (source_filter and source_filter != "both")
+            or chat_retention_cutoff_iso is not None
+        )
+        knn_k = top_k * 4 if needs_overfetch else top_k
 
         # ``vec_chunks`` is the source-of-truth for "which embeddings
         # exist"; we LEFT JOIN ``vault_chunks`` so a vector with no
@@ -529,18 +542,41 @@ class MemoryStore:
             stype = r["source_type"] or "vault"
             if wanted is not None and stype != wanted:
                 continue
-            text = r["vault_text"] or ""
-            excerpt = text[:500]
-            hits.append(
-                SearchHit(
-                    chunk_id=r["chunk_id"],
-                    source_type=stype,
-                    source_path=r["vault_path"] or "",
-                    timestamp=r["vault_ts"] or "",
-                    score=_distance_to_unit(r["distance"]),
-                    excerpt=excerpt,
+            if stype == "chat":
+                meta = self._chat_meta_for_chunk(r["chunk_id"])
+                if meta is None:
+                    # Vector exists but the chat row was deleted (e.g. by
+                    # SPEC-MEMORY-02 retention sweeper). Skip silently.
+                    continue
+                ts = meta["timestamp"]
+                if (
+                    chat_retention_cutoff_iso is not None
+                    and ts < chat_retention_cutoff_iso
+                ):
+                    continue
+                hits.append(
+                    SearchHit(
+                        chunk_id=r["chunk_id"],
+                        source_type="chat",
+                        source_path=meta["source_path"],
+                        timestamp=ts,
+                        score=_distance_to_unit(r["distance"]),
+                        excerpt=meta["excerpt"],
+                    )
                 )
-            )
+            else:
+                text = r["vault_text"] or ""
+                excerpt = text[:500]
+                hits.append(
+                    SearchHit(
+                        chunk_id=r["chunk_id"],
+                        source_type=stype,
+                        source_path=r["vault_path"] or "",
+                        timestamp=r["vault_ts"] or "",
+                        score=_distance_to_unit(r["distance"]),
+                        excerpt=excerpt,
+                    )
+                )
             if len(hits) >= top_k:
                 break
         return hits
@@ -731,6 +767,7 @@ class MemoryStore:
         *,
         top_k: int = 5,
         source_filter: str | None = None,
+        chat_retention_cutoff_iso: str | None = None,
     ) -> list[SearchHit]:
         """Run a BM25 search over ``fts_chunks`` and return ranked hits.
 
@@ -739,6 +776,12 @@ class MemoryStore:
         relevance number — closer to zero = better — which we negate and
         then squash into ``[0, 1]`` via ``1 / (1 + |bm25|)`` so the score
         contract in REQ-U3 holds (positive float in [0,1]).
+
+        Phase 3: ``chat_retention_cutoff_iso`` (REQ-N5) hides chat rows
+        whose timestamp is older than the cutoff. Vault rows are not
+        retention-filtered (only chat history has a TTL per SPEC §11).
+        We over-fetch when retention is active so the post-filter cannot
+        truncate us below ``top_k``.
         """
         query = (query or "").strip()
         if not query:
@@ -755,6 +798,14 @@ class MemoryStore:
         if not match_expr:
             return []
 
+        # When chat retention is active we fetch a wider candidate pool
+        # so post-filter retention does not silently truncate the result.
+        fetch_top_k = int(top_k)
+        if chat_retention_cutoff_iso is not None and (
+            source_filter in (None, "both", "chat")
+        ):
+            fetch_top_k = max(fetch_top_k, int(top_k) * 4)
+
         sql = (
             "SELECT chunk_id, source_type, source_path, text, "
             "       bm25(fts_chunks) AS bm25_score, "
@@ -767,7 +818,7 @@ class MemoryStore:
             sql += "AND source_type = ? "
             params.append(source_filter)
         sql += "ORDER BY bm25(fts_chunks) LIMIT ?"
-        params.append(int(top_k))
+        params.append(fetch_top_k)
 
         rows = self.conn.execute(sql, params).fetchall()
 
@@ -775,6 +826,13 @@ class MemoryStore:
         for r in rows:
             chunk_meta = self._chunk_meta(r["chunk_id"], r["source_type"])
             timestamp = chunk_meta.get("timestamp", "")
+            if (
+                r["source_type"] == "chat"
+                and chat_retention_cutoff_iso is not None
+                and timestamp
+                and timestamp < chat_retention_cutoff_iso
+            ):
+                continue
             score = _bm25_to_unit(r["bm25_score"])
             excerpt_text = (r["excerpt"] or r["text"] or "")[:500]
             hits.append(
@@ -787,6 +845,8 @@ class MemoryStore:
                     excerpt=excerpt_text,
                 )
             )
+            if len(hits) >= int(top_k):
+                break
         return hits
 
     def _chunk_meta(self, chunk_id: str, source_type: str) -> dict[str, Any]:
@@ -799,7 +859,8 @@ class MemoryStore:
             if row is None:
                 return {}
             return {"timestamp": row["timestamp"], "header": row["header"]}
-        # chat rows are not written in Phase 1; fallback if we ever see one.
+        # Phase 3: chat rows now have rows in this table. Look them up via
+        # message_id which matches chunk_id by design (see chatlog.py).
         row = self.conn.execute(
             "SELECT timestamp FROM chat_messages WHERE message_id = ?",
             (chunk_id,),
@@ -807,6 +868,76 @@ class MemoryStore:
         if row is None:
             return {}
         return {"timestamp": row["timestamp"]}
+
+    def _chat_meta_for_chunk(self, chunk_id: str) -> dict[str, Any] | None:
+        """Look up timestamp + source_path + excerpt for a chat chunk.
+
+        Used by :meth:`search_dense` to attach per-result metadata for
+        chat hits (the vault JOINs in the dense SQL return NULL for them).
+        Returns ``None`` when no row exists, which lets the caller skip
+        orphan vec_chunks entries silently.
+
+        Excerpt is taken from the FTS5 row (which already holds the
+        searchable, redacted concatenation of last-user + assistant text)
+        when available; otherwise reconstructed from the payload.
+        """
+        cm = self.conn.execute(
+            "SELECT request_id, session_id, timestamp, payload "
+            "FROM chat_messages WHERE message_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        if cm is None:
+            return None
+
+        # Excerpt: FTS row holds the search text we already redacted.
+        fts = self.conn.execute(
+            "SELECT source_path, text FROM fts_chunks "
+            "WHERE chunk_id = ? AND source_type = 'chat' LIMIT 1",
+            (chunk_id,),
+        ).fetchone()
+        if fts is not None:
+            excerpt = (fts["text"] or "")[:500]
+            source_path = fts["source_path"] or (
+                f"chat/{cm['session_id'] or ''}/{cm['request_id']}"
+            )
+        else:
+            # Fallback: reconstruct from payload if the FTS row was
+            # evicted (defensive — should not happen in MVP).
+            from .chatlog import _searchable_from_payload  # noqa: PLC0415
+
+            excerpt = _searchable_from_payload(cm["payload"] or "{}")[:500]
+            source_path = (
+                f"chat/{cm['session_id'] or ''}/{cm['request_id']}"
+            )
+
+        return {
+            "timestamp": cm["timestamp"],
+            "source_path": source_path,
+            "excerpt": excerpt,
+        }
+
+    # -- chat introspection (Phase 3) --------------------------------------
+
+    def count_chat_messages(self) -> int:
+        """Total number of chat rows persisted (any tier)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM chat_messages"
+        ).fetchone()
+        return int(row["c"])
+
+    def count_chat_messages_missing_vectors(self) -> int:
+        """Chat rows that still need an embedding (always 0 if vec disabled).
+
+        Used by the background poller diagnostic log line and by tests
+        to verify the embed loop processes the queue.
+        """
+        if not self._vec_loaded:
+            return 0
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM chat_messages "
+            "WHERE message_id NOT IN (SELECT chunk_id FROM vec_chunks)"
+        ).fetchone()
+        return int(row["c"])
 
 
 # ---------------------------------------------------------------------------

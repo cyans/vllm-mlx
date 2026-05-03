@@ -164,6 +164,105 @@ _auto_inject_mcp_tools: bool = False
 _memory_enabled: bool = False
 _memory_vault_path: str | None = None
 _memory_db_path: str | None = None
+# @CODE:MEMORY-01/chatlog — Phase 3 chat persistence flag.
+# When True AND memory is enabled, every /v1/chat/completions response
+# triggers a fire-and-forget persist_chat_row() task. The store handle
+# below is opened lazily on the first persist call so import order does
+# not depend on MEMORY_DB_PATH existing at startup.
+_memory_chat_log_enabled: bool = False
+_memory_store = None  # type: ignore[assignment]  # MemoryStore | None
+_memory_redact_patterns: list = []
+_memory_store_lock = threading.Lock()
+
+
+def _get_or_open_memory_store():
+    """Return the lazily-opened MemoryStore, or None on any failure.
+
+    REQ-N4: every error path returns ``None`` so the chat completion
+    handler can short-circuit without raising. The store is opened
+    once per process lifetime and reused for the persist hook.
+    """
+    global _memory_store
+    if _memory_store is not None:
+        return _memory_store
+    if not (_memory_enabled and _memory_chat_log_enabled and _memory_db_path):
+        return None
+    with _memory_store_lock:
+        if _memory_store is not None:
+            return _memory_store
+        try:
+            from .memory.store import MemoryStore  # noqa: PLC0415
+
+            store = MemoryStore(_memory_db_path)
+            store.open()
+            _memory_store = store
+            logger.info(
+                "[memory] chat persistence store opened at %s",
+                _memory_db_path,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to open chat persistence store at %s",
+                _memory_db_path,
+            )
+            _memory_store = None
+        return _memory_store
+
+
+def _schedule_chat_persist(
+    *,
+    request_id: str,
+    session_id: str,
+    model: str,
+    messages,
+    assistant_text: str,
+    tool_calls=None,
+    latency_ms: float | None = None,
+) -> None:
+    """Fire-and-forget chat persistence (no-op when memory disabled).
+
+    REQ-N4: this function never raises. It schedules an async task and
+    returns immediately so /v1/chat/completions latency is unaffected.
+    """
+    if not (_memory_enabled and _memory_chat_log_enabled):
+        return
+    try:
+        store = _get_or_open_memory_store()
+        if store is None:
+            return
+        from .memory.chatlog import persist_chat_row  # noqa: PLC0415
+
+        # Schedule the persist coroutine. We do NOT await; the task
+        # exception is captured inside persist_chat_row itself so even
+        # if the loop drops the task reference there is nothing to leak.
+        coro = persist_chat_row(
+            store,
+            request_id=request_id,
+            session_id=session_id,
+            model=model,
+            messages=messages,
+            assistant_text=assistant_text,
+            tool_calls=tool_calls,
+            latency_ms=latency_ms,
+            redact_patterns=_memory_redact_patterns or None,
+        )
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            # No running event loop (e.g. unit tests calling the
+            # endpoint directly); fall back to running synchronously
+            # in a one-shot loop. Failures are still swallowed.
+            try:
+                asyncio.run(coro)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[memory] sync persist_chat_row fallback failed"
+                )
+    except Exception:  # noqa: BLE001 — REQ-N4
+        logger.exception(
+            "[memory] _schedule_chat_persist failed for request_id=%s",
+            request_id,
+        )
 
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
@@ -1585,7 +1684,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-    return ChatCompletionResponse(
+    # @CODE:MEMORY-01/chatlog — Phase 3 fire-and-forget chat persistence.
+    # We generate an explicit response_id so the persisted row carries
+    # the same identifier that the response advertises to the client.
+    # When MEMORY_CHAT_LOG_ENABLED=0 (default) this is a no-op and adds
+    # zero latency to /v1/chat/completions (REQ-S1 + REQ-N4).
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    response = ChatCompletionResponse(
+        id=response_id,
         model=request.model,
         choices=[
             ChatCompletionChoice(
@@ -1603,6 +1709,28 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
+
+    if _memory_enabled and _memory_chat_log_enabled:
+        try:
+            from .memory.chatlog import new_session_id  # noqa: PLC0415
+
+            assistant_persist_text = clean_output_text(cleaned_text) if cleaned_text else ""
+            _schedule_chat_persist(
+                request_id=response_id,
+                session_id=new_session_id(),
+                model=str(request.model),
+                messages=request.messages,
+                assistant_text=assistant_persist_text or "",
+                tool_calls=tool_calls,
+                latency_ms=elapsed * 1000.0,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to schedule chat persist (non-streaming); "
+                "response is unaffected"
+            )
+
+    return response
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
@@ -2469,6 +2597,43 @@ async def stream_chat_completion(
     logger.info(
         f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
+
+    # @CODE:MEMORY-01/chatlog — Phase 3 fire-and-forget chat persistence
+    # for the streaming path. We use ``accumulated_text`` as the assistant
+    # text since it captures everything yielded across the stream
+    # (reasoning markers are stripped by the parser during accumulation
+    # in ``chain_reasoning_and_tool_parsers``). When the chat log is OFF
+    # this is a no-op and adds zero work to the SSE close path.
+    if _memory_enabled and _memory_chat_log_enabled:
+        try:
+            from .memory.chatlog import new_session_id  # noqa: PLC0415
+
+            assistant_for_persist = accumulated_text or ""
+            tool_calls_for_persist = None
+            if (
+                tool_chain_state.tool_calls_detected
+                and tool_chain_state.tool_accumulated_text
+            ):
+                # The streaming tool-call payloads are emitted via SSE
+                # but we don't keep a structured copy here; the text
+                # representation is sufficient for retrieval recall.
+                tool_calls_for_persist = [
+                    {"raw": tool_chain_state.tool_accumulated_text}
+                ]
+            _schedule_chat_persist(
+                request_id=response_id,
+                session_id=new_session_id(),
+                model=str(request.model),
+                messages=request.messages,
+                assistant_text=assistant_for_persist,
+                tool_calls=tool_calls_for_persist,
+                latency_ms=elapsed * 1000.0,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to schedule chat persist (streaming); "
+                "stream is unaffected"
+            )
 
     # Send final chunk with usage if requested
     if include_usage:

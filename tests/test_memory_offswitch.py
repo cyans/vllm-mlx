@@ -179,3 +179,60 @@ class TestEnvVarNamesAreStable:
             MEMORY_DEFAULT_DB_PATH
             == "/Volumes/data/vllm-mlx-memory/memory.db"
         )
+
+    def test_phase3_env_vars_are_stable(self):
+        # SPEC-MEMORY-01 §9 — Phase 3 chat persistence env vars.
+        from vllm_mlx.memory.config import (
+            ENV_MEMORY_CHAT_EMBED_INTERVAL,
+            ENV_MEMORY_CHAT_LOG_ENABLED,
+            ENV_MEMORY_CHAT_RETENTION_DAYS,
+            ENV_MEMORY_REDACT_PATTERNS,
+        )
+
+        assert ENV_MEMORY_CHAT_LOG_ENABLED == "MEMORY_CHAT_LOG_ENABLED"
+        assert ENV_MEMORY_REDACT_PATTERNS == "MEMORY_REDACT_PATTERNS"
+        assert ENV_MEMORY_CHAT_RETENTION_DAYS == "MEMORY_CHAT_RETENTION_DAYS"
+        assert ENV_MEMORY_CHAT_EMBED_INTERVAL == "MEMORY_CHAT_EMBED_INTERVAL"
+
+
+class TestPhase3ConfigDefaults:
+    """Phase-3 chat persistence + retention defaults match SPEC §9."""
+
+    def test_chat_log_disabled_by_default(self):
+        cfg = resolve_memory_config({})
+        assert cfg.chat_log_enabled is False
+
+    def test_chat_log_enabled_via_env(self):
+        cfg = resolve_memory_config({"MEMORY_CHAT_LOG_ENABLED": "1"})
+        assert cfg.chat_log_enabled is True
+
+    def test_chat_retention_default_365_days(self):
+        cfg = resolve_memory_config({})
+        assert cfg.chat_retention_days == 365
+
+    def test_chat_retention_clamped_above_zero(self):
+        cfg = resolve_memory_config({"MEMORY_CHAT_RETENTION_DAYS": "0"})
+        # Clamps to 1 so retention always hides _something_ in the past.
+        assert cfg.chat_retention_days >= 1
+
+    def test_chat_embed_interval_default_10s(self):
+        cfg = resolve_memory_config({})
+        assert cfg.chat_embed_interval == 10.0
+
+    def test_chat_embed_interval_clamped_above_one_second(self):
+        cfg = resolve_memory_config({"MEMORY_CHAT_EMBED_INTERVAL": "0.1"})
+        assert cfg.chat_embed_interval >= 1.0
+
+    def test_redact_patterns_semicolon_separated(self):
+        cfg = resolve_memory_config(
+            {"MEMORY_REDACT_PATTERNS": r"sk-[a-z]+;password\s*[:=]"}
+        )
+        assert cfg.redact_patterns == (
+            "sk-[a-z]+",
+            r"password\s*[:=]",
+        )
+
+    def test_redact_patterns_default_empty_tuple(self):
+        cfg = resolve_memory_config({})
+        # Empty tuple signals "use SPEC defaults" in chatlog.compile_*
+        assert cfg.redact_patterns == ()

@@ -42,6 +42,11 @@ ENV_MEMORY_EMBED_BATCH = "MEMORY_EMBED_BATCH"
 ENV_MEMORY_EMBED_DIM = "MEMORY_EMBED_DIM"
 ENV_MEMORY_EMBED_DISABLED = "MEMORY_EMBED_DISABLED"
 ENV_MEMORY_HYBRID_RRF_K = "MEMORY_HYBRID_RRF_K"
+# Phase 3 — chat persistence + indexing (SPEC-MEMORY-01 §9 / REQ-E3..E4)
+ENV_MEMORY_CHAT_LOG_ENABLED = "MEMORY_CHAT_LOG_ENABLED"
+ENV_MEMORY_REDACT_PATTERNS = "MEMORY_REDACT_PATTERNS"
+ENV_MEMORY_CHAT_RETENTION_DAYS = "MEMORY_CHAT_RETENTION_DAYS"
+ENV_MEMORY_CHAT_EMBED_INTERVAL = "MEMORY_CHAT_EMBED_INTERVAL"
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,13 @@ MEMORY_DEFAULT_EMBED_DIM = 1024
 # canonical value from the original RRF paper; tuned higher to soften
 # the contribution of low-rank items.
 MEMORY_DEFAULT_HYBRID_RRF_K = 60
+# Phase 3 — defaults from SPEC-MEMORY-01 §9.
+# Chat persistence is OFF by default so REQ-S1 invariance holds even
+# when MEMORY_ENABLED=1 (vault-only mode).
+MEMORY_DEFAULT_CHAT_RETENTION_DAYS = 365
+# REQ-E4 mandates "queryable within 10 seconds" — the embed loop polls
+# every 10s by default; operators can lower this for tests.
+MEMORY_DEFAULT_CHAT_EMBED_INTERVAL = 10.0
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -90,6 +102,11 @@ class MemoryRuntimeConfig:
     embed_dim: int = MEMORY_DEFAULT_EMBED_DIM
     embed_disabled: bool = False
     hybrid_rrf_k: int = MEMORY_DEFAULT_HYBRID_RRF_K
+    # Phase 3 — chat persistence + indexing knobs.
+    chat_log_enabled: bool = False
+    redact_patterns: tuple[str, ...] = ()
+    chat_retention_days: int = MEMORY_DEFAULT_CHAT_RETENTION_DAYS
+    chat_embed_interval: float = MEMORY_DEFAULT_CHAT_EMBED_INTERVAL
     # Raw env snapshot retained for diagnostic logging only — never used
     # to drive logic.
     raw_env: Mapping[str, str] = field(default_factory=dict)
@@ -120,6 +137,32 @@ def _int_or_default(value: str | None, default: int) -> int:
             value,
         )
         return default
+
+
+def _float_or_default(value: str | None, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            "[memory] invalid float for env var, using default=%s (got %r)",
+            default,
+            value,
+        )
+        return default
+
+
+def _split_patterns(value: str | None) -> tuple[str, ...]:
+    """Parse a semicolon-separated regex list into a tuple.
+
+    SPEC §9 documents the env-var format as semicolon-separated so the
+    pattern strings can themselves contain commas (which is common in
+    regex character classes). Empty entries are dropped.
+    """
+    if not value:
+        return ()
+    return tuple(p.strip() for p in value.split(";") if p.strip())
 
 
 def resolve_memory_enabled(env: Mapping[str, str] | None) -> bool:
@@ -188,6 +231,23 @@ def resolve_memory_config(
         ),
     )
 
+    # Phase 3 — chat persistence + indexing.
+    chat_log_enabled = _truthy(env.get(ENV_MEMORY_CHAT_LOG_ENABLED))
+    redact_patterns = _split_patterns(env.get(ENV_MEMORY_REDACT_PATTERNS))
+    chat_retention_days = max(
+        1,
+        _int_or_default(
+            env.get(ENV_MEMORY_CHAT_RETENTION_DAYS),
+            MEMORY_DEFAULT_CHAT_RETENTION_DAYS,
+        ),
+    )
+    chat_embed_interval = _float_or_default(
+        env.get(ENV_MEMORY_CHAT_EMBED_INTERVAL),
+        MEMORY_DEFAULT_CHAT_EMBED_INTERVAL,
+    )
+    # Clamp to >=1s so a typo cannot pin the CPU at 100%.
+    chat_embed_interval = max(1.0, float(chat_embed_interval))
+
     return MemoryRuntimeConfig(
         enabled=enabled,
         vault_path=vault_path,
@@ -201,6 +261,10 @@ def resolve_memory_config(
         embed_dim=embed_dim,
         embed_disabled=embed_disabled,
         hybrid_rrf_k=hybrid_rrf_k,
+        chat_log_enabled=chat_log_enabled,
+        redact_patterns=redact_patterns,
+        chat_retention_days=chat_retention_days,
+        chat_embed_interval=chat_embed_interval,
         raw_env={k: v for k, v in env.items() if k.startswith("MEMORY_")},
     )
 

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any
 
 from .config import MemoryRuntimeConfig, resolve_memory_config
@@ -140,13 +141,37 @@ def search_memory(
     # 2x is a common heuristic that balances recall vs. cost.
     leg_k = top_k * 2
 
+    # REQ-N5 — chat retention is enforced at QUERY time. Eviction
+    # (deleting old rows) is SPEC-MEMORY-02 work; here we just hide
+    # them so a stale row cannot leak into the model's context window.
+    chat_cutoff_iso: str | None = None
+    if config.chat_retention_days and config.chat_retention_days > 0:
+        cutoff_epoch = time.time() - (
+            float(config.chat_retention_days) * 86400.0
+        )
+        chat_cutoff_iso = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(cutoff_epoch)
+        )
+
     # ----- BM25 leg -------------------------------------------------------
     bm25_hits: list[SearchHit] = []
     bm25_failed = False
     try:
         bm25_hits = store.search_bm25(
-            query, top_k=leg_k, source_filter=source_filter
+            query,
+            top_k=leg_k,
+            source_filter=source_filter,
+            chat_retention_cutoff_iso=chat_cutoff_iso,
         )
+    except TypeError:
+        # Backwards-compat for older Store signatures (Phase 1+2 tests).
+        try:
+            bm25_hits = store.search_bm25(
+                query, top_k=leg_k, source_filter=source_filter
+            )
+        except Exception:  # noqa: BLE001 - REQ-N4
+            logger.exception("[memory] BM25 search failed for query=%r", query)
+            bm25_failed = True
     except Exception:  # noqa: BLE001 - REQ-N4
         logger.exception("[memory] BM25 search failed for query=%r", query)
         bm25_failed = True
@@ -167,9 +192,17 @@ def search_memory(
             if qvec is None:
                 dense_failed = True
             else:
-                dense_hits = store.search_dense(
-                    qvec, top_k=leg_k, source_filter=source_filter
-                )
+                try:
+                    dense_hits = store.search_dense(
+                        qvec,
+                        top_k=leg_k,
+                        source_filter=source_filter,
+                        chat_retention_cutoff_iso=chat_cutoff_iso,
+                    )
+                except TypeError:
+                    dense_hits = store.search_dense(
+                        qvec, top_k=leg_k, source_filter=source_filter
+                    )
         except Exception:  # noqa: BLE001 - REQ-N4 / REQ-O3
             logger.exception(
                 "[memory] dense search failed for query=%r — falling back "
@@ -326,6 +359,29 @@ async def _run_mcp_stdio() -> None:
                 "search over them (BM25 still works in the meantime)",
                 missing,
             )
+
+    # Phase 3: kick off the background chat embed loop. The loop polls
+    # ``chat_messages`` for rows that have no matching ``vec_chunks``
+    # entry, embeds them in batches, and writes them back. Cost is one
+    # background asyncio task that wakes every ``chat_embed_interval``
+    # seconds (default 10s — REQ-E4 budget). The loop is robust to
+    # embedder failure (returns 0 silently) so it costs ~nothing when
+    # MEMORY_EMBED_DISABLED=1 or the model is unavailable.
+    if store is not None and config.enabled and config.chat_log_enabled:
+        from .chatlog import chat_embed_loop  # noqa: PLC0415
+
+        asyncio.create_task(
+            chat_embed_loop(
+                store,
+                embedder,
+                interval_seconds=config.chat_embed_interval,
+                batch_size=max(1, int(config.embed_batch)),
+            )
+        )
+        logger.info(
+            "[memory] chat embed loop scheduled (interval=%.1fs)",
+            float(config.chat_embed_interval),
+        )
 
     server = Server("memory")
 
