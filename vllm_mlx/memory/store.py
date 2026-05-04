@@ -1085,6 +1085,189 @@ class MemoryStore:
             n += max(0, cur.rowcount or 0)
         return n
 
+    # -- SPEC-MEMORY-02 Phase 1: chat consolidation helpers ----------------
+    def select_sessions_due_for_consolidation(
+        self, *, cutoff_iso: str, limit: int
+    ) -> list[str]:
+        """Return up to ``limit`` ``session_id`` values ready for STM→LTM.
+
+        A session is "ready" when its newest ``chat_messages.timestamp``
+        is strictly older than ``cutoff_iso`` AND no row exists in
+        ``chat_summaries`` for that ``session_id`` yet (REQ-E1 of
+        SPEC-MEMORY-02). Sessions with NULL ``session_id`` are skipped
+        — they pre-date Phase 3 grouping and are handled by the
+        retention sweeper instead.
+
+        ``limit`` bounds the per-tick batch so a single tick never
+        starves the chat path with one giant transaction. The caller
+        re-queries on the next tick to pick up the rest.
+        """
+        rows = self.conn.execute(
+            "SELECT cm.session_id, MAX(cm.timestamp) AS newest_ts "
+            "FROM chat_messages cm "
+            "WHERE cm.session_id IS NOT NULL "
+            "  AND cm.session_id NOT IN ("
+            "        SELECT session_id FROM chat_summaries"
+            "  ) "
+            "GROUP BY cm.session_id "
+            "HAVING MAX(cm.timestamp) < ? "
+            "ORDER BY newest_ts "
+            "LIMIT ?",
+            (str(cutoff_iso), int(limit)),
+        ).fetchall()
+        return [str(r["session_id"]) for r in rows]
+
+    def fetch_chat_session_messages(
+        self, session_id: str
+    ) -> list[dict[str, Any]]:
+        """Return every chat row for ``session_id`` in chronological order.
+
+        Each entry carries ``message_id``, ``request_id``, ``role``,
+        ``payload`` (JSON string), and ``timestamp``. The consolidator
+        feeds this list into the summarizer prompt and uses
+        ``message_id`` to scope subsequent FTS / vec deletions.
+        """
+        rows = self.conn.execute(
+            "SELECT message_id, request_id, role, payload, timestamp "
+            "FROM chat_messages "
+            "WHERE session_id = ? "
+            "ORDER BY timestamp, message_id",
+            (str(session_id),),
+        ).fetchall()
+        return [
+            {
+                "message_id": str(r["message_id"]),
+                "request_id": str(r["request_id"] or ""),
+                "role": str(r["role"] or ""),
+                "payload": str(r["payload"] or ""),
+                "timestamp": str(r["timestamp"] or ""),
+            }
+            for r in rows
+        ]
+
+    def insert_chat_summary(
+        self,
+        *,
+        session_id: str,
+        summary_text: str,
+        period_start: str,
+        period_end: str,
+        source_count: int,
+    ) -> None:
+        """Insert one row into ``chat_summaries`` (idempotent on PK conflict).
+
+        REQ-U2: every summary row carries a non-null ``session_id``,
+        ``period_start``, ``period_end``, and ``source_count`` matching
+        the source messages it consolidated. Caller must wrap in
+        :meth:`transaction` along with the matching eviction so the
+        write/delete pair is atomic (REQ-N4).
+
+        Conflict policy: ``INSERT OR IGNORE`` keeps the existing row
+        when a previous tick already wrote it — the consolidator's
+        SELECT excludes summarized sessions, but defense-in-depth.
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO chat_summaries("
+            "  session_id, summary_text, period_start, period_end, "
+            "  source_count, created_at"
+            ") VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                str(session_id),
+                str(summary_text),
+                str(period_start),
+                str(period_end),
+                int(source_count),
+                time.time(),
+            ),
+        )
+
+    def evict_chat_messages_for_session(self, session_id: str) -> int:
+        """Delete every ``chat_messages`` row + cascade FTS/vec for a session.
+
+        Returns the number of rows deleted from ``chat_messages``.
+        Caller must wrap in :meth:`transaction` together with the
+        matching :meth:`insert_chat_summary` call so the pair is
+        atomic.
+
+        Cascade order matters: drop FTS rows first (they reference
+        chunk_id), then vec rows, then the parent. The FTS5 contentless
+        table cannot rely on a foreign-key cascade so we DELETE
+        explicitly per ``message_id``.
+        """
+        sid = str(session_id)
+        ids_rows = self.conn.execute(
+            "SELECT message_id FROM chat_messages WHERE session_id = ?",
+            (sid,),
+        ).fetchall()
+        message_ids = [str(r["message_id"]) for r in ids_rows]
+        for mid in message_ids:
+            self.conn.execute(
+                "DELETE FROM fts_chunks WHERE chunk_id = ?", (mid,)
+            )
+            if self._vec_loaded:
+                self.conn.execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (mid,)
+                )
+        cur = self.conn.execute(
+            "DELETE FROM chat_messages WHERE session_id = ?", (sid,)
+        )
+        return max(0, cur.rowcount or 0)
+
+    def fetch_session_period(
+        self, session_id: str
+    ) -> tuple[str | None, str | None, int]:
+        """Return ``(period_start, period_end, source_count)`` for a session.
+
+        Computes MIN/MAX timestamp across ``chat_messages`` for the
+        given ``session_id``, plus the row count. Returns
+        ``(None, None, 0)`` for sessions with no rows.
+
+        Used by the consolidator to populate the summary row's audit
+        fields (REQ-U2) without re-scanning the message list a second
+        time.
+        """
+        row = self.conn.execute(
+            "SELECT MIN(timestamp) AS first_ts, "
+            "       MAX(timestamp) AS last_ts, "
+            "       COUNT(*)        AS n "
+            "FROM chat_messages WHERE session_id = ?",
+            (str(session_id),),
+        ).fetchone()
+        if row is None or row["n"] is None or int(row["n"]) == 0:
+            return None, None, 0
+        return (
+            str(row["first_ts"]) if row["first_ts"] else None,
+            str(row["last_ts"]) if row["last_ts"] else None,
+            int(row["n"]),
+        )
+
+    def fetch_consolidated_session_ids(
+        self, session_ids: Iterable[str]
+    ) -> set[str]:
+        """Return the subset of ``session_ids`` that have summary rows.
+
+        Used by the retention sweeper when
+        ``MEMORY_SUMMARIZE_BEFORE_DELETE=1`` so it never deletes raw
+        chat rows whose consolidator pass has not yet succeeded
+        (REQ-N4 of SPEC-MEMORY-02).
+        """
+        ids = sorted({str(s) for s in session_ids if s is not None})
+        if not ids:
+            return set()
+        # Chunk the IN clause to stay well below SQLite's 999-param cap.
+        out: set[str] = set()
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            sub = ids[i : i + chunk]
+            placeholders = ",".join("?" * len(sub))
+            rows = self.conn.execute(
+                f"SELECT session_id FROM chat_summaries "
+                f"WHERE session_id IN ({placeholders})",
+                sub,
+            ).fetchall()
+            out.update(str(r["session_id"]) for r in rows)
+        return out
+
     # -- Phase 4: diagnostic stats ----------------------------------------
     def get_memory_stats(self) -> dict[str, Any]:
         """Return a snapshot of indexed-content counts + last sweep marker.

@@ -87,6 +87,7 @@ class RetentionSweeper:
         mode: str,
         sweep_interval_seconds: float,
         batch_size: int = DEFAULT_SWEEP_BATCH_SIZE,
+        summarize_before_delete: bool = False,
     ):
         self.store = store
         self.retention_days = int(retention_days)
@@ -103,6 +104,13 @@ class RetentionSweeper:
         self.mode = mode
         self.sweep_interval = max(1.0, float(sweep_interval_seconds))
         self.batch_size = max(1, int(batch_size))
+        # SPEC-MEMORY-02 Phase 1 integration: when True, the sweeper
+        # treats the consolidator as the owner of un-summarized rows
+        # and only touches rows whose ``session_id`` already has a
+        # ``chat_summaries`` entry. When False (the original Phase 4
+        # behavior) the sweeper deletes/redacts every row past the
+        # retention boundary regardless of summarization state.
+        self.summarize_before_delete = bool(summarize_before_delete)
 
     # --------------------------------------------------------- run loop
 
@@ -182,6 +190,27 @@ class RetentionSweeper:
                 break
             total_evaluated += len(ids)
 
+            # SPEC-MEMORY-02 Phase 1 integration (REQ-N4): when
+            # ``summarize_before_delete`` is on, narrow the candidate
+            # set to message_ids whose session has been consolidated.
+            # The consolidator owns the rest. This ensures the sweeper
+            # never races the consolidator into deleting raw rows
+            # without a surviving summary.
+            if self.summarize_before_delete:
+                ids = self._filter_to_consolidated(ids)
+
+            if not ids:
+                # All candidates in this batch belong to sessions still
+                # waiting for the consolidator. Skip the write step but
+                # check the next batch — the cutoff cursor advances.
+                if self.batch_size > 0:
+                    # Advance past these message_ids by re-querying
+                    # excluding the unsummarized ones is too expensive;
+                    # just bail out — next sweep tick re-checks once
+                    # the consolidator has caught up.
+                    break
+                continue
+
             with self.store.transaction():
                 if self.mode == "delete":
                     changed = self.store.delete_chat_messages(ids)
@@ -213,6 +242,59 @@ class RetentionSweeper:
             cutoff_iso=cutoff_iso,
             mode=self.mode,
         )
+
+    # ---------------------------------------------- consolidator helper
+    def _filter_to_consolidated(
+        self, message_ids: list[str]
+    ) -> list[str]:
+        """Restrict ``message_ids`` to rows whose session is summarized.
+
+        SPEC-MEMORY-02 Phase 1 / REQ-N4: when the operator opts into
+        ``MEMORY_SUMMARIZE_BEFORE_DELETE=1`` (the default in the new
+        config), the sweeper must skip rows whose ``session_id`` has
+        no entry in ``chat_summaries``. Those rows belong to the
+        consolidator and will be evicted in the same transaction that
+        writes the summary.
+
+        Returns the (possibly empty) subset of ``message_ids`` that
+        are safe for the sweeper to delete or redact this tick.
+        """
+        if not message_ids:
+            return []
+        # Look up each message's session_id; rows with NULL session_id
+        # are pre-Phase-3 data that the consolidator cannot summarize,
+        # so we let the sweeper handle them as before.
+        placeholders = ",".join("?" * len(message_ids))
+        rows = self.store.conn.execute(
+            f"SELECT message_id, session_id FROM chat_messages "
+            f"WHERE message_id IN ({placeholders})",
+            list(message_ids),
+        ).fetchall()
+        if not rows:
+            return []
+        sid_for: dict[str, str | None] = {
+            str(r["message_id"]): (
+                str(r["session_id"]) if r["session_id"] is not None else None
+            )
+            for r in rows
+        }
+        # Sessions present in chat_summaries are safe to evict.
+        non_null_sids = {s for s in sid_for.values() if s}
+        consolidated_sids: set[str] = (
+            self.store.fetch_consolidated_session_ids(non_null_sids)
+            if non_null_sids
+            else set()
+        )
+        out: list[str] = []
+        for mid in message_ids:
+            sid = sid_for.get(str(mid))
+            if sid is None:
+                # NULL session_id — pre-Phase-3 row, sweep as before.
+                out.append(str(mid))
+            elif sid in consolidated_sids:
+                out.append(str(mid))
+            # else: skip — consolidator owns it.
+        return out
 
 
 # ---------------------------------------------------------------------------

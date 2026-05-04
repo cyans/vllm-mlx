@@ -54,6 +54,20 @@ ENV_MEMORY_RETENTION_SWEEP_INTERVAL_SECONDS = (
     "MEMORY_RETENTION_SWEEP_INTERVAL_SECONDS"
 )
 ENV_MEMORY_CHAT_RETENTION_MODE = "MEMORY_CHAT_RETENTION_MODE"
+# SPEC-MEMORY-02 Phase 1 — chat consolidation scheduler + summarizer.
+# Names mirror SPEC-MEMORY-02 §10. The "_SELF" sentinel for the
+# summarizer model means "use the live engine via dependency
+# injection"; future phases may load a smaller HF model lazily.
+ENV_MEMORY_CONSOLIDATOR_ENABLED = "MEMORY_CONSOLIDATOR_ENABLED"
+ENV_MEMORY_CONSOLIDATOR_HOUR = "MEMORY_CONSOLIDATOR_HOUR"
+ENV_MEMORY_CONSOLIDATOR_DEADLINE_SEC = "MEMORY_CONSOLIDATOR_DEADLINE_SEC"
+ENV_MEMORY_CONSOLIDATOR_BATCH = "MEMORY_CONSOLIDATOR_BATCH"
+ENV_MEMORY_CONSOLIDATOR_DRYRUN = "MEMORY_CONSOLIDATOR_DRYRUN"
+ENV_MEMORY_SUMMARIZE_BEFORE_DELETE = "MEMORY_SUMMARIZE_BEFORE_DELETE"
+ENV_MEMORY_SUMMARY_MIN_CHARS = "MEMORY_SUMMARY_MIN_CHARS"
+ENV_MEMORY_SUMMARIZER_MODEL = "MEMORY_SUMMARIZER_MODEL"
+ENV_MEMORY_SUMMARY_INPUT_BUDGET = "MEMORY_SUMMARY_INPUT_BUDGET"
+ENV_MEMORY_STM_DAYS = "MEMORY_STM_DAYS"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +116,25 @@ MEMORY_DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
 # the FTS/vector index entries so the redacted text is never returned.
 MEMORY_DEFAULT_CHAT_RETENTION_MODE = "delete"
 MEMORY_VALID_RETENTION_MODES = frozenset({"delete", "redact"})
+# SPEC-MEMORY-02 §10 defaults.
+# STM/LTM threshold from MEMORY-01 §9 (declared then, consumed now).
+MEMORY_DEFAULT_STM_DAYS = 30
+# Daily consolidator tick at 03:00 local — quietest hour on most setups.
+MEMORY_DEFAULT_CONSOLIDATOR_HOUR = 3
+# Per-tick wall-clock cap (30 minutes); sessions roll over to next tick.
+MEMORY_DEFAULT_CONSOLIDATOR_DEADLINE_SEC = 1800
+# Inner-batch session count.
+MEMORY_DEFAULT_CONSOLIDATOR_BATCH = 10
+# REQ-N4: summaries below this character count never trigger eviction
+# of the source rows. 40 is short enough to allow terse one-line
+# summaries but long enough to reject empty / degenerate output.
+MEMORY_DEFAULT_SUMMARY_MIN_CHARS = 40
+# "self" => use live engine via dependency injection. Any other value is
+# a Hugging Face model id reserved for Phase 4 lazy-load (REQ-O2).
+MEMORY_DEFAULT_SUMMARIZER_MODEL = "self"
+# 8000 input tokens caps the concatenated session before we recursively
+# chunk-summarize. Operator override per SPEC §6.
+MEMORY_DEFAULT_SUMMARY_INPUT_BUDGET = 8000
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -141,6 +174,23 @@ class MemoryRuntimeConfig:
         MEMORY_DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS
     )
     chat_retention_mode: str = MEMORY_DEFAULT_CHAT_RETENTION_MODE
+    # SPEC-MEMORY-02 Phase 1 — chat consolidation knobs.
+    # ``consolidator_enabled`` defaults to ``MEMORY_ENABLED`` so a single
+    # master switch turns the whole STM/LTM lifecycle on/off.
+    consolidator_enabled: bool = False
+    consolidator_hour: int = MEMORY_DEFAULT_CONSOLIDATOR_HOUR
+    consolidator_deadline_sec: int = MEMORY_DEFAULT_CONSOLIDATOR_DEADLINE_SEC
+    consolidator_batch: int = MEMORY_DEFAULT_CONSOLIDATOR_BATCH
+    consolidator_dryrun: bool = False
+    # When True, the retention sweeper SKIPS chat rows whose session_id
+    # has no entry in chat_summaries — those belong to the consolidator.
+    # When False, sweeper falls back to MEMORY-01 Phase 4 behavior
+    # (raw delete or redact at retention boundary, no consolidator).
+    summarize_before_delete: bool = True
+    summary_min_chars: int = MEMORY_DEFAULT_SUMMARY_MIN_CHARS
+    summarizer_model: str = MEMORY_DEFAULT_SUMMARIZER_MODEL
+    summary_input_budget: int = MEMORY_DEFAULT_SUMMARY_INPUT_BUDGET
+    stm_days: int = MEMORY_DEFAULT_STM_DAYS
     # Raw env snapshot retained for diagnostic logging only — never used
     # to drive logic.
     raw_env: Mapping[str, str] = field(default_factory=dict)
@@ -327,6 +377,69 @@ def resolve_memory_config(
         )
         chat_retention_mode = MEMORY_DEFAULT_CHAT_RETENTION_MODE
 
+    # SPEC-MEMORY-02 Phase 1 — consolidator knobs.
+    # The master switch defaults to ``enabled`` so MEMORY_ENABLED=1 is
+    # sufficient to turn the whole STM/LTM lifecycle on. An explicit
+    # MEMORY_CONSOLIDATOR_ENABLED=0 disables only the consolidator.
+    raw_consolidator_enabled = env.get(ENV_MEMORY_CONSOLIDATOR_ENABLED)
+    if raw_consolidator_enabled is None or raw_consolidator_enabled == "":
+        consolidator_enabled = bool(enabled)
+    else:
+        consolidator_enabled = _truthy(raw_consolidator_enabled)
+    consolidator_hour = _int_or_default(
+        env.get(ENV_MEMORY_CONSOLIDATOR_HOUR),
+        MEMORY_DEFAULT_CONSOLIDATOR_HOUR,
+    )
+    # Hour is wrapped to [0, 23]; a typo cannot crash the scheduler.
+    consolidator_hour = consolidator_hour % 24
+    consolidator_deadline_sec = max(
+        60,
+        _int_or_default(
+            env.get(ENV_MEMORY_CONSOLIDATOR_DEADLINE_SEC),
+            MEMORY_DEFAULT_CONSOLIDATOR_DEADLINE_SEC,
+        ),
+    )
+    consolidator_batch = max(
+        1,
+        _int_or_default(
+            env.get(ENV_MEMORY_CONSOLIDATOR_BATCH),
+            MEMORY_DEFAULT_CONSOLIDATOR_BATCH,
+        ),
+    )
+    consolidator_dryrun = _truthy(env.get(ENV_MEMORY_CONSOLIDATOR_DRYRUN))
+    # ``summarize_before_delete`` defaults to True (the safe path) so
+    # the sweeper does not race the consolidator. Setting the env var
+    # to ``0`` reverts to MEMORY-01 Phase 4 behavior.
+    raw_sbd = env.get(ENV_MEMORY_SUMMARIZE_BEFORE_DELETE)
+    if raw_sbd is None or raw_sbd == "":
+        summarize_before_delete = True
+    else:
+        summarize_before_delete = _truthy(raw_sbd)
+    summary_min_chars = max(
+        0,
+        _int_or_default(
+            env.get(ENV_MEMORY_SUMMARY_MIN_CHARS),
+            MEMORY_DEFAULT_SUMMARY_MIN_CHARS,
+        ),
+    )
+    summarizer_model = (
+        (env.get(ENV_MEMORY_SUMMARIZER_MODEL) or "").strip()
+        or MEMORY_DEFAULT_SUMMARIZER_MODEL
+    )
+    summary_input_budget = max(
+        256,
+        _int_or_default(
+            env.get(ENV_MEMORY_SUMMARY_INPUT_BUDGET),
+            MEMORY_DEFAULT_SUMMARY_INPUT_BUDGET,
+        ),
+    )
+    stm_days = max(
+        1,
+        _int_or_default(
+            env.get(ENV_MEMORY_STM_DAYS), MEMORY_DEFAULT_STM_DAYS
+        ),
+    )
+
     return MemoryRuntimeConfig(
         enabled=enabled,
         vault_path=vault_path,
@@ -348,6 +461,16 @@ def resolve_memory_config(
         watcher_debounce_ms=watcher_debounce_ms,
         retention_sweep_interval_seconds=retention_sweep_interval_seconds,
         chat_retention_mode=chat_retention_mode,
+        consolidator_enabled=consolidator_enabled,
+        consolidator_hour=consolidator_hour,
+        consolidator_deadline_sec=consolidator_deadline_sec,
+        consolidator_batch=consolidator_batch,
+        consolidator_dryrun=consolidator_dryrun,
+        summarize_before_delete=summarize_before_delete,
+        summary_min_chars=summary_min_chars,
+        summarizer_model=summarizer_model,
+        summary_input_budget=summary_input_budget,
+        stm_days=stm_days,
         raw_env={k: v for k, v in env.items() if k.startswith("MEMORY_")},
     )
 
