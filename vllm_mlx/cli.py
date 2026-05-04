@@ -91,6 +91,17 @@ def serve_command(args):
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
 
+    # Configure runtime memory-pressure guardrail (vllm_mlx.memory.budget).
+    # CLI > MEMORY_HEADROOM_GB env > module default. The lifespan reads the
+    # globals on the server module after the model is loaded.
+    from .memory.budget import resolve_memory_headroom_gb_from_os
+    server._memory_headroom_gb = resolve_memory_headroom_gb_from_os(
+        cli_value=getattr(args, "memory_headroom_gb", None),
+    )
+    interval = getattr(args, "memory_check_interval_s", None)
+    if interval is not None:
+        server._memory_check_interval_s = float(interval)
+
     # Configure reasoning parser
     if args.reasoning_parser:
         try:
@@ -948,6 +959,28 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Runtime memory-pressure guardrail (vllm_mlx.memory.budget).
+    # Soft guard — logs a structured warning when free RAM drops below the
+    # target after the model loads; does NOT kill the server. Falls back to
+    # MEMORY_HEADROOM_GB env var, then the module default.
+    serve_parser.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=None,
+        help=(
+            "Minimum free-RAM headroom in GiB to keep available after the "
+            "model loads (soft warn-only guardrail, default 6.0)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--memory-check-interval-s",
+        type=float,
+        default=None,
+        help=(
+            "Interval in seconds between periodic memory-headroom checks "
+            "(default 30s)."
+        ),
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

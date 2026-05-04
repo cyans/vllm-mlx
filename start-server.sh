@@ -1,5 +1,47 @@
 #!/usr/bin/env bash
-# 가상환경 활성화 후 vLLM-MLX 서버 시작 (Qwen 3.5 35B + MCP + reasoning)
+# Canonical vLLM-MLX server launcher (Qwen3.6 + MCP + reasoning/tool-call parsers).
+#
+# ============================================================================
+# PRE-LAUNCH MEMORY CHECKLIST (read this before starting on a 64 GB Mac)
+# ----------------------------------------------------------------------------
+# A 35B-A3B 4-bit model with continuous batching at --cache-memory-percent 0.4
+# routinely runs at 28-34 GB unified memory. If the host is also running
+# Chrome with 80 tabs, Slack, Docker Desktop, etc., free RAM can collapse and
+# the M-series watchdog will trip a kernel panic. To avoid that:
+#
+#   1. Close heavy GUI apps before launching (browsers, IDEs you are not
+#      actively using, Docker Desktop, video calls).
+#   2. Aim for ≥ 8 GB free RAM BEFORE you start the server. Check with
+#      `vm_stat` or `memory_pressure -Q`.
+#   3. The server now enforces a soft headroom guardrail via
+#      --memory-headroom-gb (default 6 GiB). It logs structured warnings
+#      when free RAM drops below the target; it does NOT kill itself.
+#      Monitor live state with: `curl localhost:8001/memory/budget`.
+#   4. If you see repeated headroom warnings, lower --cache-memory-percent
+#      or close more apps; do not raise --memory-headroom-gb past your
+#      actual free-RAM ceiling.
+# ============================================================================
+#
+# Defaults: model=mlx-community/Qwen3.6-35B-A3B-4bit (resolved via
+# vllm_mlx.config.models.resolve_model_id), port 8001, host 0.0.0.0,
+# continuous batching, prefix cache, KV cache 40%, 180s request timeout.
+#
+# Reasoning parser is auto-resolved from the model id (qwen36 for 3.6,
+# qwen3 for 3.5). Auto-tool-choice is ON by default with the tool-call
+# parser resolved against the live ToolParserManager registry.
+#
+# Common overrides (env vars):
+#   VLLM_MLX_MODEL_ID=...                  pin a different model id (e.g. Qwen3.5)
+#   VLLM_MLX_REASONING_PARSER=...          force a specific reasoning parser
+#   VLLM_MLX_TOOL_CALL_PARSER=...          force a specific tool-call parser
+#   VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE=1    revert to pre-Phase-1 (no auto tool choice)
+#   VLLM_MLX_AUTO_INJECT_MCP_TOOLS=1       inject MCP tools when client sends none
+#
+# History (2026-04-27): consolidated start-server-qwen36.sh into this file.
+# The retired sibling carried a `--language-model-only` flag that was never
+# wired into vllm_mlx/server.py and produced an argparse error at runtime
+# (see docs/blog/qwen36-on-mac-mini-m4pro.md §6). This unified launcher is
+# the only supported entry point going forward.
 
 set -e
 cd "$(dirname "$0")"
@@ -10,7 +52,6 @@ if [[ ! -d .venv ]]; then
 fi
 
 source .venv/bin/activate
-# Qwen 3.5 35B는 텍스트 전용이므로 --mllm 제거 (MLLM 경로는 tools 미전달 이슈 있음)
 # --host 0.0.0.0: 같은 네트워크의 다른 기기에서 접속 가능 (기본값이지만 명시)
 # 성능 튜닝 (Qwen 3.6 + MCP auto-inject 관찰 결과 반영):
 # - prefix cache 활성화: system prompt / MCP tool schema 재사용으로 TTFT 크게 감소
@@ -56,4 +97,5 @@ exec vllm-mlx serve "$MODEL_ID" \
   --max-tokens 8192 \
   --cache-memory-percent 0.4 \
   --timeout 180 \
+  --memory-headroom-gb 6 \
   "${EXTRA_FLAGS[@]}"

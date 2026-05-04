@@ -112,6 +112,12 @@ from .api.utils import (
 )
 from .config.models import resolve_tool_parser  # noqa: F401 — @CODE:MIGRATE-QWEN36/server
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .memory.budget import (
+    DEFAULT_HEADROOM_GB,
+    DEFAULT_INTERVAL_SECONDS,
+    MemoryBudget,
+    resolve_memory_headroom_gb_from_os,
+)
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -125,8 +131,22 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
+# Memory-pressure guardrail config (see vllm_mlx.memory.budget).
+# Resolved at CLI parse time via resolve_memory_headroom_gb_from_os; the
+# lifespan reads it after the model loads.
+_memory_headroom_gb: float = DEFAULT_HEADROOM_GB
+_memory_check_interval_s: float = DEFAULT_INTERVAL_SECONDS
+_memory_budget_task: asyncio.Task | None = None
+
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
+
+# SPEC-MEMORY-02 Phase 1 — consolidator scheduler task handle.
+# The chat-consolidation scheduler runs as a long-lived asyncio task
+# spawned during ``lifespan`` startup so it can call the live engine
+# directly (no MCP IPC, no HTTP self-call). Tracked here so the
+# lifespan teardown can cancel it cleanly on shutdown.
+_consolidator_task: asyncio.Task | None = None  # noqa: F821 - typing-only forward ref
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -337,7 +357,7 @@ def _get_cache_dir() -> str:
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _consolidator_task, _memory_budget_task
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
@@ -347,12 +367,89 @@ async def lifespan(app: FastAPI):
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
 
+    # Memory-pressure guardrail: post-load one-shot check + periodic warner.
+    # Runs after the model is fully loaded so that "headroom gone" reflects
+    # the actual steady-state working set, not the unloaded baseline. This
+    # is intentionally non-fatal: we log loudly and let the operator decide.
+    try:
+        budget = MemoryBudget()
+        ok, details = budget.check_headroom(_memory_headroom_gb)
+        budget.log_headroom(_memory_headroom_gb, force_info=True)
+        if not ok:
+            logger.warning(
+                "[memory-budget] post-load headroom check FAILED. "
+                "Free RAM is below the configured target — the kernel "
+                "may compress/swap aggressively under load. Consider "
+                "closing heavy GUI apps, lowering --cache-memory-percent, "
+                "or raising --memory-headroom-gb if this is expected. "
+                "Details: %s",
+                details,
+            )
+        # Stash the budget on app.state so the /memory/budget endpoint can
+        # read it without a module-level global on the budget itself.
+        app.state.memory_budget = budget
+        _memory_budget_task = budget.start_periodic_check(
+            app,
+            interval_s=_memory_check_interval_s,
+            headroom_gb=_memory_headroom_gb,
+        )
+    except Exception:  # noqa: BLE001 — guardrail must never block startup
+        logger.exception(
+            "[memory-budget] failed to initialize; server will start without "
+            "the memory-pressure watcher"
+        )
+        _memory_budget_task = None
+
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # SPEC-MEMORY-02 Phase 1: spawn the chat-consolidator scheduler.
+    # Runs in the FastAPI parent so it can call the live engine
+    # directly via ``await _engine.generate(...)`` and share the same
+    # asyncio loop as ``/v1/chat/completions`` for the
+    # ``summarizer_slot`` semaphore to function as contention control.
+    # All failures are isolated (REQ-N4): the chat path is unaffected
+    # if the consolidator fails to spawn or its tick raises.
+    try:
+        _consolidator_task = _maybe_start_consolidator(_engine)
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception(
+            "[memory-02] failed to start chat consolidator; "
+            "chat path unaffected"
+        )
+        _consolidator_task = None
+
     yield
+
+    # Shutdown: cancel the memory-budget periodic task. It holds no
+    # resources, but cancelling it cleanly keeps shutdown logs tidy.
+    if _memory_budget_task is not None:
+        _memory_budget_task.cancel()
+        try:
+            await _memory_budget_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "[memory-budget] periodic task raised on shutdown"
+            )
+        _memory_budget_task = None
+
+    # Shutdown: cancel the consolidator first so it doesn't try to
+    # acquire the semaphore against an engine that's already stopping.
+    if _consolidator_task is not None:
+        _consolidator_task.cancel()
+        try:
+            await _consolidator_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - defensive
+            logger.exception(
+                "[memory-02] consolidator task raised on shutdown"
+            )
+        _consolidator_task = None
 
     # Shutdown: Save cache to disk BEFORE stopping engine
     if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
@@ -365,6 +462,86 @@ async def lifespan(app: FastAPI):
     if _engine is not None:
         await _engine.stop()
         logger.info("Engine stopped")
+
+
+def _maybe_start_consolidator(engine: BaseEngine | None) -> asyncio.Task | None:
+    """Spawn the SPEC-MEMORY-02 Phase 1 chat consolidator if configured.
+
+    Returns the asyncio Task on success, or None when the consolidator
+    is disabled (default when ``MEMORY_ENABLED=0``), the store cannot
+    be opened, or any setup step fails. Failures are logged but never
+    raised — the chat path must keep working.
+    """
+    from .memory.config import resolve_memory_config_from_os  # noqa: PLC0415
+    from .memory.consolidator import ChatConsolidator  # noqa: PLC0415
+    from .memory.scheduler import run_scheduler_loop  # noqa: PLC0415
+    from .memory.store import MemoryStore  # noqa: PLC0415
+
+    config = resolve_memory_config_from_os()
+    if not config.enabled or not config.consolidator_enabled:
+        logger.info(
+            "[memory-02] consolidator disabled "
+            "(MEMORY_ENABLED=%s, MEMORY_CONSOLIDATOR_ENABLED=%s); "
+            "scheduler not started",
+            config.enabled,
+            config.consolidator_enabled,
+        )
+        return None
+    if engine is None:
+        logger.warning(
+            "[memory-02] no engine loaded; chat consolidator skipped "
+            "(STM→LTM will not run until an engine is configured)"
+        )
+        return None
+
+    # The consolidator opens its own store handle so chat-path writes
+    # and consolidator writes never share a SQLite connection (WAL
+    # makes this safe and simple).
+    try:
+        store = MemoryStore(config.db_path, embed_dim=config.embed_dim)
+        store.open()
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception(
+            "[memory-02] failed to open memory store at %s; "
+            "consolidator skipped",
+            config.db_path,
+        )
+        return None
+
+    summarizer_slot = asyncio.Semaphore(1)
+    consolidator = ChatConsolidator(
+        store,
+        engine,
+        config,
+        summarizer_slot=summarizer_slot,
+    )
+
+    async def _tick() -> None:
+        await consolidator.run_once()
+
+    def _enabled() -> bool:
+        # Re-resolve so an operator can flip the env var at runtime
+        # without restarting the server.
+        live = resolve_memory_config_from_os()
+        return bool(live.enabled and live.consolidator_enabled)
+
+    task = asyncio.create_task(
+        run_scheduler_loop(
+            _tick,
+            hour=int(config.consolidator_hour),
+            enabled_check=_enabled,
+        )
+    )
+    logger.info(
+        "[memory-02] consolidator scheduled "
+        "(hour=%d batch=%d deadline=%ds dryrun=%s stm_days=%d)",
+        int(config.consolidator_hour),
+        int(config.consolidator_batch),
+        int(config.consolidator_deadline_sec),
+        config.consolidator_dryrun,
+        int(config.stm_days),
+    )
+    return task
 
 
 app = FastAPI(
@@ -701,6 +878,25 @@ async def health():
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
+
+
+@app.get("/memory/budget")
+async def memory_budget_endpoint(request: Request):
+    """Return the current memory-pressure snapshot.
+
+    See ``vllm_mlx.memory.budget`` for the underlying implementation. The
+    response is the dict produced by :meth:`MemoryBudget.check_headroom`
+    plus a ``configured_interval_s`` field, suitable for scraping into
+    Prometheus or similar monitoring.
+    """
+    budget = getattr(request.app.state, "memory_budget", None)
+    if budget is None:
+        # Lifespan failed to initialize the budget — fall back to a
+        # stateless one so the endpoint stays useful for debugging.
+        budget = MemoryBudget()
+    _ok, details = budget.check_headroom(_memory_headroom_gb)
+    details["configured_interval_s"] = float(_memory_check_interval_s)
+    return details
 
 
 @app.get("/v1/status")
@@ -2804,18 +3000,52 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=None,
+        help=(
+            "Minimum free-RAM headroom in GiB to keep available after the "
+            "model loads. The server logs a structured warning (but does "
+            "NOT exit) when free RAM drops below this target. Falls back "
+            "to MEMORY_HEADROOM_GB env var, then "
+            f"{DEFAULT_HEADROOM_GB:.1f} GiB."
+        ),
+    )
+    parser.add_argument(
+        "--memory-check-interval-s",
+        type=float,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=(
+            "Interval in seconds between periodic memory-headroom checks. "
+            f"Default: {DEFAULT_INTERVAL_SECONDS:.0f}s."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
     global _default_temperature, _default_top_p
+    global _memory_headroom_gb, _memory_check_interval_s
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+
+    # Memory-pressure guardrail config: CLI > env (MEMORY_HEADROOM_GB) > default.
+    _memory_headroom_gb = resolve_memory_headroom_gb_from_os(
+        cli_value=args.memory_headroom_gb,
+    )
+    if args.memory_check_interval_s is not None:
+        _memory_check_interval_s = float(args.memory_check_interval_s)
+    logger.info(
+        "Memory-pressure guardrail: headroom=%.2f GiB, interval=%.1fs",
+        _memory_headroom_gb,
+        _memory_check_interval_s,
+    )
 
     # Configure rate limiter
     if args.rate_limit > 0:
