@@ -1,8 +1,14 @@
 # @CODE:FIX-QWEN36-AUTO-TOOL-CHOICE/launcher-tests
-# Phase 1 tests: verify that start-server*.sh launchers pass
+# Phase 1 tests: verify that the canonical launcher passes
 # --enable-auto-tool-choice by default, with opt-out via the
-# VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE environment variable. The 122B mint
-# launcher is explicitly out of scope for Phase 1 (REQ-N1).
+# VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE environment variable.
+#
+# History (2026-04-27): start-server-qwen36.sh has been consolidated into
+# start-server.sh; the dedicated qwen36 launcher tests were removed in the
+# same change.
+# History (2026-05-05): start-server-122b-mint.sh and the 122B-specific
+# scripts were removed; the 122B-launcher-untouched regression guard
+# (REQ-N1 of SPEC-FIX-QWEN36-AUTO-TOOL-CHOICE) is now obsolete.
 import re
 from pathlib import Path
 
@@ -41,27 +47,15 @@ def test_start_server_has_auto_tool_choice_block():
     _assert_gated_auto_tool_choice_block(_read("start-server.sh"), "start-server.sh")
 
 
-def test_start_server_qwen36_has_auto_tool_choice_block():
-    _assert_gated_auto_tool_choice_block(
-        _read("start-server-qwen36.sh"), "start-server-qwen36.sh"
+def test_auto_tool_choice_is_not_hardcoded_in_exec():
+    # The flag should be added via EXTRA_FLAGS, not appear twice in the exec line.
+    content = _read("start-server.sh")
+    exec_line = re.search(r"exec vllm-mlx serve[^\n]*\\", content)
+    assert (
+        exec_line is None or "--enable-auto-tool-choice" not in exec_line.group(0)
+    ), (
+        "start-server.sh: --enable-auto-tool-choice should not be hardcoded in exec line; "
+        "use EXTRA_FLAGS"
     )
 
 
-def test_auto_tool_choice_is_not_hardcoded_in_exec():
-    # The flag should be added via EXTRA_FLAGS, not appear twice in the exec line.
-    for name in ("start-server.sh", "start-server-qwen36.sh"):
-        content = _read(name)
-        exec_line = re.search(r"exec vllm-mlx serve[^\n]*\\", content)
-        assert (
-            exec_line is None or "--enable-auto-tool-choice" not in exec_line.group(0)
-        ), (
-            f"{name}: --enable-auto-tool-choice should not be hardcoded in exec line; "
-            "use EXTRA_FLAGS"
-        )
-
-
-def test_122b_launcher_untouched():
-    # start-server-122b-mint.sh is OUT OF SCOPE per REQ-N1.
-    content = _read("start-server-122b-mint.sh")
-    assert "VLLM_MLX_DISABLE_AUTO_TOOL_CHOICE" not in content
-    assert "--enable-auto-tool-choice" not in content
