@@ -16,8 +16,45 @@ import time
 from typing import Any
 
 import mlx.core as mx
-from mlx_lm import generate, load
+import mlx.nn as nn
+from mlx_lm import generate, load as _mlx_load
 from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+# Qwen3.6-35B-A3B-4bit 같은 VL 가중치가 섞인 체크포인트도 텍스트 경로만으로
+# 로드할 수 있도록, mlx_lm.load 호출 동안만 nn.Module.load_weights 를 lenient
+# 모드로 살짝 바꾼다. patch_attention() 은 mlx_lm.SDPA 를 패치하므로
+# 텍스트 경로에서 그대로 유효하다.
+_VL_FILTER_TOKENS = (
+    "vision_tower",
+    "patch_embed",
+    "merger.linear_fc",
+    "merger.norm",
+    "pos_embed.weight",
+)
+
+
+def _load(model_id: str) -> Any:
+    """mlx_lm.load — VL 가중치는 무시하고 strict=False 로 로딩."""
+    original = nn.Module.load_weights
+
+    def _lenient(self, weights, strict=True):  # type: ignore[no-untyped-def]
+        if isinstance(weights, list):
+            weights = [
+                (k, v)
+                for k, v in weights
+                if not any(tok in k for tok in _VL_FILTER_TOKENS)
+            ]
+        return original(self, weights, strict=False)
+
+    nn.Module.load_weights = _lenient  # type: ignore[assignment]
+    try:
+        return _mlx_load(model_id)
+    finally:
+        nn.Module.load_weights = original  # type: ignore[assignment]
+
+
+# Backwards-compatible alias for the rest of the script.
+load = _load
 
 # @CODE:MIGRATE-QWEN36 — the default model id is owned by
 # vllm_mlx.config.models, not hardcoded here. Use --model on the CLI to
