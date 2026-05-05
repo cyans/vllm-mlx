@@ -252,11 +252,6 @@ def main() -> None:
     if args.baseline_only and args.turbo_only:
         print("--baseline-only 와 --turbo-only 는 동시에 쓸 수 없습니다.", file=sys.stderr)
         sys.exit(2)
-    if args.long_context and args.baseline_only:
-        print(
-            "경고: --long-context 는 TurboQuant 패스에만 적용됩니다. --baseline-only 이므로 건너뜁니다.",
-            file=sys.stderr,
-        )
 
     raw = args.prompts.strip().lower()
     if raw == "all":
@@ -294,6 +289,20 @@ def main() -> None:
                 model, tokenizer, prompt, args.max_tokens, label
             )
 
+        if args.long_context:
+            lc_prompt = _long_context_prompt(args.long_context_repeats)
+            print(
+                f"\n{'─' * 60}\n>>> long_context "
+                f"({args.long_context_repeats} repeats)\n{'─' * 60}"
+            )
+            results.setdefault("long_context", {})["baseline"] = _run_baseline(
+                model,
+                tokenizer,
+                lc_prompt,
+                args.long_context_tokens,
+                "long_context",
+            )
+
         _release_model(model, tokenizer)
 
     if not args.baseline_only:
@@ -325,17 +334,18 @@ def main() -> None:
 
         if args.long_context:
             lc_prompt = _long_context_prompt(args.long_context_repeats)
-            print(f"\n{'─' * 60}\n>>> long_context ({args.long_context_repeats} repeats)\n{'─' * 60}")
-            results["long_context"] = {
-                "turbo": _run_turbo(
-                    model,
-                    tokenizer,
-                    lc_prompt,
-                    args.long_context_tokens,
-                    "long_context",
-                    TurboQuantKVCache,
-                )
-            }
+            print(
+                f"\n{'─' * 60}\n>>> long_context "
+                f"({args.long_context_repeats} repeats)\n{'─' * 60}"
+            )
+            results.setdefault("long_context", {})["turbo"] = _run_turbo(
+                model,
+                tokenizer,
+                lc_prompt,
+                args.long_context_tokens,
+                "long_context",
+                TurboQuantKVCache,
+            )
 
         _release_model(model, tokenizer)
 
