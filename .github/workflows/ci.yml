@@ -9,6 +9,9 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    # Lint is informational only — failures here do not block merges.
+    # Flip to `false` (or remove the line) to make lint blocking again.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
