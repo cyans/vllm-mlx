@@ -26,8 +26,14 @@ def serve_command(args):
 
     # Import unified server
     from . import server
+    from .config.models import (
+        TOOL_PARSER_FALLBACK,
+        TOOL_PARSER_PREFERRED,
+        resolve_tool_parser,
+    )
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
+    from .tool_parsers import ToolParserManager
 
     logger = logging.getLogger(__name__)
 
@@ -45,10 +51,36 @@ def serve_command(args):
             requests_per_minute=args.rate_limit, enabled=True
         )
 
-    # Configure tool calling
+    # Configure tool calling.
+    # @CODE:MIGRATE-QWEN36/server — spec §6.3: resolve the tool-call parser
+    # against the live ToolParserManager registry, preferring
+    # TOOL_PARSER_PREFERRED ("qwen3_coder") and falling back to
+    # TOOL_PARSER_FALLBACK ("qwen"). An explicit --tool-call-parser CLI
+    # value always wins (behavior-preserving in Phase 1).
     if args.enable_auto_tool_choice and args.tool_call_parser:
         server._enable_auto_tool_choice = True
         server._tool_call_parser = args.tool_call_parser
+        try:
+            registered = list(ToolParserManager.tool_parsers.keys()) + list(
+                ToolParserManager.lazy_parsers.keys()
+            )
+            resolved = resolve_tool_parser(registered)
+            source = (
+                "preferred-available"
+                if resolved == TOOL_PARSER_PREFERRED
+                else "fallback"
+            )
+            logger.info(
+                "Tool parser selection: user=%s, resolved=%s (%s), "
+                "preferred=%s, fallback=%s",
+                args.tool_call_parser,
+                resolved,
+                source,
+                TOOL_PARSER_PREFERRED,
+                TOOL_PARSER_FALLBACK,
+            )
+        except Exception as e:  # noqa: BLE001 - log-only, never block startup
+            logger.warning("Tool parser resolution logging failed: %s", e)
     else:
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
@@ -58,6 +90,17 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+
+    # Configure runtime memory-pressure guardrail (vllm_mlx.memory.budget).
+    # CLI > MEMORY_HEADROOM_GB env > module default. The lifespan reads the
+    # globals on the server module after the model is loaded.
+    from .memory.budget import resolve_memory_headroom_gb_from_os
+    server._memory_headroom_gb = resolve_memory_headroom_gb_from_os(
+        cli_value=getattr(args, "memory_headroom_gb", None),
+    )
+    interval = getattr(args, "memory_check_interval_s", None)
+    if interval is not None:
+        server._memory_check_interval_s = float(interval)
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -112,6 +155,61 @@ def serve_command(args):
     if args.mcp_config:
         print(f"MCP config: {args.mcp_config}")
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — propagate CLI flag to the
+    # server module's single source of truth. The startup log line is emitted
+    # from the server module itself via _log_mcp_auto_inject_status() so the
+    # status is visible in both the CLI and the FastAPI lifespan path.
+    server._auto_inject_mcp_tools = bool(args.auto_inject_mcp_tools)
+    server._log_mcp_auto_inject_status(server._auto_inject_mcp_tools)
+
+    # @CODE:LEGACY-THINK-TAGS/cli — propagate the resolved flag (CLI arg OR
+    # env var fallback) to the server module's single source of truth.
+    from .config.models import resolve_legacy_think_tags
+
+    legacy_think_tags = resolve_legacy_think_tags(
+        cli_flag=bool(args.legacy_think_tags),
+        env=os.environ,
+    )
+    server._legacy_think_tags = legacy_think_tags
+    if legacy_think_tags:
+        logger.info(
+            "Legacy <think>...</think> tag rewrite ENABLED "
+            "(reasoning channel routed into content channel for "
+            "legacy-client compatibility)."
+        )
+
+    # @CODE:MEMORY-01/cli — Phase 1 memory subsystem env-var pass-through.
+    # The launcher just logs the resolved values for operator visibility;
+    # the actual indexer + MCP server runs in a child process spawned by
+    # the MCP manager (mcp.json's ``memory`` entry). REQ-S1: when
+    # MEMORY_ENABLED is not truthy this block is silent.
+    from .memory import resolve_memory_config
+
+    memory_cfg = resolve_memory_config(os.environ)
+    server._memory_enabled = memory_cfg.enabled
+    server._memory_vault_path = str(memory_cfg.vault_path)
+    server._memory_db_path = str(memory_cfg.db_path)
+    # @CODE:MEMORY-01/chatlog — Phase 3 chat persistence wiring.
+    server._memory_chat_log_enabled = memory_cfg.chat_log_enabled
+    if memory_cfg.chat_log_enabled:
+        from .memory.chatlog import compile_redact_patterns
+
+        server._memory_redact_patterns = compile_redact_patterns(
+            list(memory_cfg.redact_patterns) or None
+        )
+    if memory_cfg.enabled:
+        logger.info(
+            "[memory] subsystem ENABLED: vault=%s db=%s top_k_default=%d "
+            "top_k_max=%d chat_log=%s retention_days=%d "
+            "(configure via mcp.json's 'memory' server entry)",
+            memory_cfg.vault_path,
+            memory_cfg.db_path,
+            memory_cfg.top_k_default,
+            memory_cfg.top_k_max,
+            memory_cfg.chat_log_enabled,
+            memory_cfg.chat_retention_days,
+        )
 
     # Pre-load embedding model if specified
     if args.embedding_model:
@@ -735,6 +833,41 @@ Examples:
         default=None,
         help="Path to MCP configuration file (JSON/YAML) for tool integration",
     )
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — opt-in automatic MCP tool
+    # injection into /v1/chat/completions. Default stays OFF so bit-for-bit
+    # compat with Qwen 3.5 is preserved per SPEC-FIX-QWEN36-RUNTIME REQ-N2.
+    serve_parser.add_argument(
+        "--auto-inject-mcp-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Auto-inject MCP-registered tools into /v1/chat/completions "
+            "requests that do not provide their own 'tools' field. When the "
+            "request already has tools, MCP tools are merged (client tools "
+            "win on name collision). Default: off."
+        ),
+    )
+    # @CODE:LEGACY-THINK-TAGS/cli — opt-in legacy-client compatibility shim.
+    # When enabled, Qwen3.6 thinking content is re-emitted inline in
+    # ``delta.content`` / ``message.content`` wrapped in ``<think>...</think>``
+    # so legacy clients that ignore ``delta.reasoning`` (notably the Obsidian
+    # MoAI plugin) can hide it via their existing regex filter. Default OFF
+    # preserves the OpenAI-style ``reasoning`` / ``reasoning_content`` channel
+    # routing for conformant clients. The env var
+    # ``VLLM_MLX_LEGACY_THINK_TAGS=1`` provides a launcher-friendly fallback;
+    # the CLI flag wins when both are supplied.
+    serve_parser.add_argument(
+        "--legacy-think-tags",
+        action="store_true",
+        default=False,
+        help=(
+            "Re-emit Qwen3.6 thinking content as inline <think>...</think> "
+            "blocks in the regular content channel (instead of the OpenAI "
+            "reasoning/reasoning_content fields). For legacy clients that "
+            "ignore reasoning fields. Env fallback: "
+            "VLLM_MLX_LEGACY_THINK_TAGS=1. Default: off."
+        ),
+    )
     # Security options
     serve_parser.add_argument(
         "--api-key",
@@ -826,6 +959,28 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Runtime memory-pressure guardrail (vllm_mlx.memory.budget).
+    # Soft guard — logs a structured warning when free RAM drops below the
+    # target after the model loads; does NOT kill the server. Falls back to
+    # MEMORY_HEADROOM_GB env var, then the module default.
+    serve_parser.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=None,
+        help=(
+            "Minimum free-RAM headroom in GiB to keep available after the "
+            "model loads (soft warn-only guardrail, default 6.0)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--memory-check-interval-s",
+        type=float,
+        default=None,
+        help=(
+            "Interval in seconds between periodic memory-headroom checks "
+            "(default 30s)."
+        ),
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

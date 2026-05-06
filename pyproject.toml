@@ -59,7 +59,14 @@ dependencies = [
     "pytz>=2024.1",
     # Note: mlx-audio moved to optional [audio] deps due to mlx-lm version conflict
     # See: https://github.com/waybarrios/vllm-mlx/issues/19
-    "mlx-embeddings>=0.0.5"
+    "mlx-embeddings>=0.0.5",
+    # SPEC-MEMORY-01 Phase 2: vector ANN over local SQLite, no daemon.
+    # Pure-C MIT-licensed extension; pre-built macosx-arm64 wheel on PyPI.
+    "sqlite-vec>=0.1.6",
+    # SPEC-MEMORY-01 Phase 4: FSEvents-backed vault watcher (macOS sub-second
+    # detection) and the retention sweeper. v6 ships a maintained Python 3.13
+    # wheel and drops the old PyQt observer that no one uses.
+    "watchdog>=6.0"
 ]
 
 [project.optional-dependencies]
@@ -96,6 +103,10 @@ audio = [
     "fugashi>=1.3.0",        # Japanese tokenizer
     "unidic-lite>=1.0.0",    # Japanese dictionary for fugashi
     "jieba>=0.42.0",         # Chinese word segmentation
+]
+# TurboQuant / OptiQ (PLAN.md Phase 1+) — mlx-lm 호환 KV 캐시·혼합정밀 양자화
+turboquant = [
+    "mlx-optiq[all]>=0.0.2",
 ]
 
 [project.urls]

@@ -52,6 +52,7 @@ from collections.abc import AsyncIterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -59,6 +60,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+# @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — thin re-exports. The real
+# implementations live in vllm_mlx.api.mcp_inject so they can be imported
+# and tested without the mlx / metal-heavy engine side of this module.
+from .api.mcp_inject import (
+    log_mcp_auto_inject_status as _log_mcp_auto_inject_status,
+    resolve_effective_tools as _resolve_effective_tools,
+)
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -102,7 +110,14 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
+from .config.models import resolve_tool_parser  # noqa: F401 — @CODE:MIGRATE-QWEN36/server
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .memory.budget import (
+    DEFAULT_HEADROOM_GB,
+    DEFAULT_INTERVAL_SECONDS,
+    MemoryBudget,
+    resolve_memory_headroom_gb_from_os,
+)
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -116,8 +131,22 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
+# Memory-pressure guardrail config (see vllm_mlx.memory.budget).
+# Resolved at CLI parse time via resolve_memory_headroom_gb_from_os; the
+# lifespan reads it after the model loads.
+_memory_headroom_gb: float = DEFAULT_HEADROOM_GB
+_memory_check_interval_s: float = DEFAULT_INTERVAL_SECONDS
+_memory_budget_task: asyncio.Task | None = None
+
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
+
+# SPEC-MEMORY-02 Phase 1 — consolidator scheduler task handle.
+# The chat-consolidation scheduler runs as a long-lived asyncio task
+# spawned during ``lifespan`` startup so it can call the live engine
+# directly (no MCP IPC, no HTTP self-call). Tracked here so the
+# lifespan teardown can cancel it cleanly on shutdown.
+_consolidator_task: asyncio.Task | None = None  # noqa: F821 - typing-only forward ref
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -142,6 +171,119 @@ def _resolve_top_p(request_value: float | None) -> float:
 _mcp_manager = None
 _mcp_executor = None
 
+# @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — opt-in flag set from CLI.
+# Default OFF preserves bit-for-bit compat with Qwen 3.5 per REQ-N2.
+_auto_inject_mcp_tools: bool = False
+
+# @CODE:MEMORY-01/server — Phase 1 memory subsystem flag. Default OFF
+# preserves REQ-S1 (bit-for-bit compat with a build without this SPEC).
+# When True, the launcher logs resolved memory paths and operators are
+# expected to enable the matching ``memory`` entry in ``mcp.json``;
+# the actual indexer + search logic lives in the spawned MCP child
+# process (vllm_mlx.memory.server), not in this FastAPI process.
+_memory_enabled: bool = False
+_memory_vault_path: str | None = None
+_memory_db_path: str | None = None
+# @CODE:MEMORY-01/chatlog — Phase 3 chat persistence flag.
+# When True AND memory is enabled, every /v1/chat/completions response
+# triggers a fire-and-forget persist_chat_row() task. The store handle
+# below is opened lazily on the first persist call so import order does
+# not depend on MEMORY_DB_PATH existing at startup.
+_memory_chat_log_enabled: bool = False
+_memory_store = None  # type: ignore[assignment]  # MemoryStore | None
+_memory_redact_patterns: list = []
+_memory_store_lock = threading.Lock()
+
+
+def _get_or_open_memory_store():
+    """Return the lazily-opened MemoryStore, or None on any failure.
+
+    REQ-N4: every error path returns ``None`` so the chat completion
+    handler can short-circuit without raising. The store is opened
+    once per process lifetime and reused for the persist hook.
+    """
+    global _memory_store
+    if _memory_store is not None:
+        return _memory_store
+    if not (_memory_enabled and _memory_chat_log_enabled and _memory_db_path):
+        return None
+    with _memory_store_lock:
+        if _memory_store is not None:
+            return _memory_store
+        try:
+            from .memory.store import MemoryStore  # noqa: PLC0415
+
+            store = MemoryStore(_memory_db_path)
+            store.open()
+            _memory_store = store
+            logger.info(
+                "[memory] chat persistence store opened at %s",
+                _memory_db_path,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to open chat persistence store at %s",
+                _memory_db_path,
+            )
+            _memory_store = None
+        return _memory_store
+
+
+def _schedule_chat_persist(
+    *,
+    request_id: str,
+    session_id: str,
+    model: str,
+    messages,
+    assistant_text: str,
+    tool_calls=None,
+    latency_ms: float | None = None,
+) -> None:
+    """Fire-and-forget chat persistence (no-op when memory disabled).
+
+    REQ-N4: this function never raises. It schedules an async task and
+    returns immediately so /v1/chat/completions latency is unaffected.
+    """
+    if not (_memory_enabled and _memory_chat_log_enabled):
+        return
+    try:
+        store = _get_or_open_memory_store()
+        if store is None:
+            return
+        from .memory.chatlog import persist_chat_row  # noqa: PLC0415
+
+        # Schedule the persist coroutine. We do NOT await; the task
+        # exception is captured inside persist_chat_row itself so even
+        # if the loop drops the task reference there is nothing to leak.
+        coro = persist_chat_row(
+            store,
+            request_id=request_id,
+            session_id=session_id,
+            model=model,
+            messages=messages,
+            assistant_text=assistant_text,
+            tool_calls=tool_calls,
+            latency_ms=latency_ms,
+            redact_patterns=_memory_redact_patterns or None,
+        )
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            # No running event loop (e.g. unit tests calling the
+            # endpoint directly); fall back to running synchronously
+            # in a one-shot loop. Failures are still swallowed.
+            try:
+                asyncio.run(coro)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[memory] sync persist_chat_row fallback failed"
+                )
+    except Exception:  # noqa: BLE001 — REQ-N4
+        logger.exception(
+            "[memory] _schedule_chat_persist failed for request_id=%s",
+            request_id,
+        )
+
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
@@ -152,6 +294,16 @@ _auth_warning_logged: bool = False
 
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
 _reasoning_parser = None  # ReasoningParser instance when enabled
+
+# @CODE:LEGACY-THINK-TAGS/server — opt-in legacy-client compatibility shim.
+# When True, reasoning content is re-emitted inline in the regular ``content``
+# channel wrapped in ``<think>...</think>`` (both streaming and non-streaming),
+# and the OpenAI ``reasoning`` / ``reasoning_content`` fields are forced to
+# None. This lets clients that ignore the ``reasoning`` channel (notably the
+# Obsidian MoAI plugin's ``<think>`` regex filter) hide thinking content
+# without server-side or client-side code changes. Default OFF preserves the
+# conformant OpenAI streaming contract for all other clients.
+_legacy_think_tags: bool = False
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
@@ -205,7 +357,7 @@ def _get_cache_dir() -> str:
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    global _engine, _mcp_manager, _consolidator_task, _memory_budget_task
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
@@ -215,12 +367,89 @@ async def lifespan(app: FastAPI):
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
         _load_prefix_cache_from_disk()
 
+    # Memory-pressure guardrail: post-load one-shot check + periodic warner.
+    # Runs after the model is fully loaded so that "headroom gone" reflects
+    # the actual steady-state working set, not the unloaded baseline. This
+    # is intentionally non-fatal: we log loudly and let the operator decide.
+    try:
+        budget = MemoryBudget()
+        ok, details = budget.check_headroom(_memory_headroom_gb)
+        budget.log_headroom(_memory_headroom_gb, force_info=True)
+        if not ok:
+            logger.warning(
+                "[memory-budget] post-load headroom check FAILED. "
+                "Free RAM is below the configured target — the kernel "
+                "may compress/swap aggressively under load. Consider "
+                "closing heavy GUI apps, lowering --cache-memory-percent, "
+                "or raising --memory-headroom-gb if this is expected. "
+                "Details: %s",
+                details,
+            )
+        # Stash the budget on app.state so the /memory/budget endpoint can
+        # read it without a module-level global on the budget itself.
+        app.state.memory_budget = budget
+        _memory_budget_task = budget.start_periodic_check(
+            app,
+            interval_s=_memory_check_interval_s,
+            headroom_gb=_memory_headroom_gb,
+        )
+    except Exception:  # noqa: BLE001 — guardrail must never block startup
+        logger.exception(
+            "[memory-budget] failed to initialize; server will start without "
+            "the memory-pressure watcher"
+        )
+        _memory_budget_task = None
+
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # SPEC-MEMORY-02 Phase 1: spawn the chat-consolidator scheduler.
+    # Runs in the FastAPI parent so it can call the live engine
+    # directly via ``await _engine.generate(...)`` and share the same
+    # asyncio loop as ``/v1/chat/completions`` for the
+    # ``summarizer_slot`` semaphore to function as contention control.
+    # All failures are isolated (REQ-N4): the chat path is unaffected
+    # if the consolidator fails to spawn or its tick raises.
+    try:
+        _consolidator_task = _maybe_start_consolidator(_engine)
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception(
+            "[memory-02] failed to start chat consolidator; "
+            "chat path unaffected"
+        )
+        _consolidator_task = None
+
     yield
+
+    # Shutdown: cancel the memory-budget periodic task. It holds no
+    # resources, but cancelling it cleanly keeps shutdown logs tidy.
+    if _memory_budget_task is not None:
+        _memory_budget_task.cancel()
+        try:
+            await _memory_budget_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "[memory-budget] periodic task raised on shutdown"
+            )
+        _memory_budget_task = None
+
+    # Shutdown: cancel the consolidator first so it doesn't try to
+    # acquire the semaphore against an engine that's already stopping.
+    if _consolidator_task is not None:
+        _consolidator_task.cancel()
+        try:
+            await _consolidator_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - defensive
+            logger.exception(
+                "[memory-02] consolidator task raised on shutdown"
+            )
+        _consolidator_task = None
 
     # Shutdown: Save cache to disk BEFORE stopping engine
     if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
@@ -235,11 +464,100 @@ async def lifespan(app: FastAPI):
         logger.info("Engine stopped")
 
 
+def _maybe_start_consolidator(engine: BaseEngine | None) -> asyncio.Task | None:
+    """Spawn the SPEC-MEMORY-02 Phase 1 chat consolidator if configured.
+
+    Returns the asyncio Task on success, or None when the consolidator
+    is disabled (default when ``MEMORY_ENABLED=0``), the store cannot
+    be opened, or any setup step fails. Failures are logged but never
+    raised — the chat path must keep working.
+    """
+    from .memory.config import resolve_memory_config_from_os  # noqa: PLC0415
+    from .memory.consolidator import ChatConsolidator  # noqa: PLC0415
+    from .memory.scheduler import run_scheduler_loop  # noqa: PLC0415
+    from .memory.store import MemoryStore  # noqa: PLC0415
+
+    config = resolve_memory_config_from_os()
+    if not config.enabled or not config.consolidator_enabled:
+        logger.info(
+            "[memory-02] consolidator disabled "
+            "(MEMORY_ENABLED=%s, MEMORY_CONSOLIDATOR_ENABLED=%s); "
+            "scheduler not started",
+            config.enabled,
+            config.consolidator_enabled,
+        )
+        return None
+    if engine is None:
+        logger.warning(
+            "[memory-02] no engine loaded; chat consolidator skipped "
+            "(STM→LTM will not run until an engine is configured)"
+        )
+        return None
+
+    # The consolidator opens its own store handle so chat-path writes
+    # and consolidator writes never share a SQLite connection (WAL
+    # makes this safe and simple).
+    try:
+        store = MemoryStore(config.db_path, embed_dim=config.embed_dim)
+        store.open()
+    except Exception:  # noqa: BLE001 - REQ-N4
+        logger.exception(
+            "[memory-02] failed to open memory store at %s; "
+            "consolidator skipped",
+            config.db_path,
+        )
+        return None
+
+    summarizer_slot = asyncio.Semaphore(1)
+    consolidator = ChatConsolidator(
+        store,
+        engine,
+        config,
+        summarizer_slot=summarizer_slot,
+    )
+
+    async def _tick() -> None:
+        await consolidator.run_once()
+
+    def _enabled() -> bool:
+        # Re-resolve so an operator can flip the env var at runtime
+        # without restarting the server.
+        live = resolve_memory_config_from_os()
+        return bool(live.enabled and live.consolidator_enabled)
+
+    task = asyncio.create_task(
+        run_scheduler_loop(
+            _tick,
+            hour=int(config.consolidator_hour),
+            enabled_check=_enabled,
+        )
+    )
+    logger.info(
+        "[memory-02] consolidator scheduled "
+        "(hour=%d batch=%d deadline=%ds dryrun=%s stm_days=%d)",
+        int(config.consolidator_hour),
+        int(config.consolidator_batch),
+        int(config.consolidator_deadline_sec),
+        config.consolidator_dryrun,
+        int(config.stm_days),
+    )
+    return task
+
+
 app = FastAPI(
     title="vllm-mlx API",
     description="OpenAI-compatible API for MLX LLM/MLLM inference on Apple Silicon",
     version="0.2.1",
     lifespan=lifespan,
+)
+
+# CORS: OPTIONS preflight from browsers / n8n etc. would otherwise get 405
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 security = HTTPBearer(auto_error=False)
@@ -562,6 +880,25 @@ async def health():
     }
 
 
+@app.get("/memory/budget")
+async def memory_budget_endpoint(request: Request):
+    """Return the current memory-pressure snapshot.
+
+    See ``vllm_mlx.memory.budget`` for the underlying implementation. The
+    response is the dict produced by :meth:`MemoryBudget.check_headroom`
+    plus a ``configured_interval_s`` field, suitable for scraping into
+    Prometheus or similar monitoring.
+    """
+    budget = getattr(request.app.state, "memory_budget", None)
+    if budget is None:
+        # Lifespan failed to initialize the budget — fall back to a
+        # stateless one so the endpoint stays useful for debugging.
+        budget = MemoryBudget()
+    _ok, details = budget.check_headroom(_memory_headroom_gb)
+    details["configured_interval_s"] = float(_memory_check_interval_s)
+    return details
+
+
 @app.get("/v1/status")
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
@@ -637,6 +974,20 @@ async def list_models() -> ModelsResponse:
     if _model_name:
         models.append(ModelInfo(id=_model_name))
     return ModelsResponse(data=models)
+
+
+@app.get("/v1/models/{model_id:path}", dependencies=[Depends(verify_api_key)])
+async def get_model(model_id: str) -> ModelInfo:
+    """
+    Return a single model by id (OpenAI-compatible).
+    LangChain and other clients call this to resolve MODEL_NOT_FOUND; without it they get 404.
+    With a single loaded model, any model_id is accepted so that clients using different
+    naming (e.g. "default", full HF id, or alias) still get 200.
+    """
+    if not _model_name:
+        raise HTTPException(status_code=404, detail="No model loaded")
+    # Single-model server: accept any model_id so LangChain/n8n etc. don't get 404
+    return ModelInfo(id=_model_name)
 
 
 # =============================================================================
@@ -776,7 +1127,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 async def list_mcp_tools() -> MCPToolsResponse:
     """List all available MCP tools."""
     if _mcp_manager is None:
-        return MCPToolsResponse(tools=[], count=0)
+        return MCPToolsResponse(tools=[], count=0, max_tool_calls=30)
 
     tools = []
     for tool in _mcp_manager.get_all_tools():
@@ -788,8 +1139,10 @@ async def list_mcp_tools() -> MCPToolsResponse:
                 parameters=tool.input_schema,
             )
         )
-
-    return MCPToolsResponse(tools=tools, count=len(tools))
+    max_tool_calls = getattr(
+        _mcp_manager.config, "max_tool_calls", 30
+    )
+    return MCPToolsResponse(tools=tools, count=len(tools), max_tool_calls=max_tool_calls)
 
 
 @app.get("/v1/mcp/servers", dependencies=[Depends(verify_api_key)])
@@ -1241,6 +1594,99 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     )
 
 
+def _responses_input_to_messages(body: dict) -> list:
+    """Convert OpenAI Responses API 'input' to chat 'messages'."""
+    inp = body.get("input")
+    if inp is None:
+        return body.get("messages", [])
+    if isinstance(inp, str):
+        return [{"role": "user", "content": inp}]
+    if not isinstance(inp, list):
+        return [{"role": "user", "content": str(inp)}]
+    messages = []
+    for item in inp:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+        elif isinstance(item, dict):
+            if item.get("type") == "input_text":
+                messages.append({"role": "user", "content": item.get("text", "")})
+            elif item.get("role") and "content" in item:
+                # Normalize content: convert input_text -> text for downstream
+                content = item["content"]
+                if isinstance(content, list):
+                    content = [
+                        {**part, "type": "text"} if isinstance(part, dict) and part.get("type") == "input_text" else part
+                        for part in content
+                    ]
+                messages.append(
+                    {"role": item["role"], "content": content}
+                )
+            else:
+                messages.append({"role": "user", "content": str(item)})
+        else:
+            messages.append({"role": "user", "content": str(item)})
+    return messages if messages else [{"role": "user", "content": ""}]
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_response(raw_request: Request):
+    """
+    Adapter for OpenAI Responses API (POST /v1/responses).
+    Converts request to chat completions and returns the same response shape
+    so clients (n8n, LangChain, etc.) that call /v1/responses get 200 instead of 404.
+    """
+    try:
+        body = await raw_request.json()
+    except Exception:
+        body = {}
+    messages = _responses_input_to_messages(body)
+    model = body.get("model") or _model_name or "default"
+    stream = body.get("stream", False)
+    # Build Message list: support dict or already Message-like
+    msg_list = []
+    for m in messages:
+        if isinstance(m, dict):
+            try:
+                msg_list.append(Message.model_validate(m))
+            except Exception:
+                msg_list.append(
+                    Message(role=m.get("role", "user"), content=m.get("content", ""))
+                )
+        else:
+            msg_list.append(m)
+    chat_request = ChatCompletionRequest(
+        model=model,
+        messages=msg_list,
+        stream=stream,
+        max_tokens=body.get("max_tokens") or body.get("max_output_tokens"),
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+    )
+    result = await create_chat_completion(chat_request, raw_request)
+
+    # n8n AI Agent expects response.output to be iterable (Responses API shape)
+    if isinstance(result, ChatCompletionResponse):
+        output_items = []
+        if result.choices:
+            msg = result.choices[0].message
+            text = (msg.content or "") if hasattr(msg, "content") else ""
+            output_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            })
+        return {
+            "id": getattr(result, "id", None),
+            "model": result.model,
+            "output": output_items,
+            "usage": result.usage.model_dump() if hasattr(result.usage, "model_dump") else result.usage,
+        }
+    return result
+
+
 @app.post(
     "/v1/chat/completions",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
@@ -1360,8 +1806,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
     # Add tools if provided
-    if request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — resolve the effective tool
+    # list through _resolve_effective_tools so the /v1/chat/completions
+    # endpoint can optionally surface MCP-registered tools to the model.
+    # When --auto-inject-mcp-tools is OFF this is a no-op and behaviour is
+    # bit-for-bit identical to the pre-Phase-2 server (REQ-N2).
+    effective_tools = _resolve_effective_tools(
+        request.tools, _mcp_manager, _auto_inject_mcp_tools
+    )
+    if effective_tools:
+        chat_kwargs["tools"] = convert_tools_for_template(effective_tools)
 
     if request.stream:
         return StreamingResponse(
@@ -1401,6 +1855,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             text_to_parse
         )
 
+    # @CODE:LEGACY-THINK-TAGS/server-nonstream — when the legacy-tag shim is
+    # enabled and we extracted reasoning, fold it back into ``cleaned_text``
+    # as an inline ``<think>...</think>`` block and clear ``reasoning_text``.
+    # The downstream ``AssistantMessage(content=..., reasoning=None, ...)``
+    # then renders correctly for legacy clients while the OpenAI-conformant
+    # ``reasoning`` / ``reasoning_content`` channel stays empty.
+    if _legacy_think_tags and reasoning_text:
+        cleaned_text = (
+            f"<think>\n{reasoning_text}\n</think>\n{cleaned_text or ''}"
+        )
+        reasoning_text = None
+
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
         json_input = cleaned_text or output.text
@@ -1414,7 +1880,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-    return ChatCompletionResponse(
+    # @CODE:MEMORY-01/chatlog — Phase 3 fire-and-forget chat persistence.
+    # We generate an explicit response_id so the persisted row carries
+    # the same identifier that the response advertises to the client.
+    # When MEMORY_CHAT_LOG_ENABLED=0 (default) this is a no-op and adds
+    # zero latency to /v1/chat/completions (REQ-S1 + REQ-N4).
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    response = ChatCompletionResponse(
+        id=response_id,
         model=request.model,
         choices=[
             ChatCompletionChoice(
@@ -1432,6 +1905,28 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
+
+    if _memory_enabled and _memory_chat_log_enabled:
+        try:
+            from .memory.chatlog import new_session_id  # noqa: PLC0415
+
+            assistant_persist_text = clean_output_text(cleaned_text) if cleaned_text else ""
+            _schedule_chat_persist(
+                request_id=response_id,
+                session_id=new_session_id(),
+                model=str(request.model),
+                messages=request.messages,
+                assistant_text=assistant_persist_text or "",
+                tool_calls=tool_calls,
+                latency_ms=elapsed * 1000.0,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to schedule chat persist (non-streaming); "
+                "response is unaffected"
+            )
+
+    return response
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
@@ -1847,6 +2342,163 @@ async def stream_completion(
     yield "data: [DONE]\n\n"
 
 
+# @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — pure helper for chaining the
+# reasoning parser and the tool-call parser inside the SSE loop. Keeping the
+# decision logic in a side-effect-free function lets the streaming contract be
+# unit-tested without bringing up FastAPI, the MLX engine, or the HTTP layer.
+# Both the reasoning-parser branch and the plain-text branch of
+# ``stream_chat_completion`` call this helper so that ``<tool_call>`` XML is
+# never leaked to ``delta.content`` — fixes the P1 bug where Qwen3.6 streaming
+# responses emitted raw XML instead of ``delta.tool_calls``.
+
+
+class _ToolChainState:
+    """Mutable state shared across all deltas in one stream.
+
+    ``tool_accumulated_text`` tracks the text that has been passed through the
+    tool parser so far — note that this is the post-reasoning-parser text
+    (i.e. content only), so it never contains ``<think>`` markup. Both
+    branches of ``stream_chat_completion`` share one instance per stream so
+    the post-stream fallback at the end of ``stream_chat_completion`` can
+    still observe in-progress tool_call markup.
+
+    ``tool_markup_possible`` is a fast-path flag: once a ``<`` character is
+    seen, every subsequent delta must be re-scanned for tool markup. Before
+    then we can skip the O(n) tag-counting work entirely.
+
+    ``tool_calls_detected`` is flipped the first time a complete
+    ``</tool_call>`` block is formatted into a streaming tool_calls chunk.
+    """
+
+    __slots__ = (
+        "tool_accumulated_text",
+        "tool_markup_possible",
+        "tool_calls_detected",
+    )
+
+    def __init__(self) -> None:
+        self.tool_accumulated_text: str = ""
+        self.tool_markup_possible: bool = False
+        self.tool_calls_detected: bool = False
+
+
+class _ChainedDelta:
+    """Result of one chain invocation.
+
+    Any of ``content``, ``reasoning``, or ``tool_calls`` may be ``None``. The
+    caller decides which SSE shape to emit based on which fields are set.
+    ``None`` (returned from the helper itself, not this container) means
+    "suppress this delta entirely" — used while inside an incomplete
+    ``<tool_call>`` block.
+    """
+
+    __slots__ = ("content", "reasoning", "tool_calls")
+
+    def __init__(
+        self,
+        *,
+        content: str | None = None,
+        reasoning: str | None = None,
+        tool_calls: list[dict] | None = None,
+    ) -> None:
+        self.content = content
+        self.reasoning = reasoning
+        self.tool_calls = tool_calls
+
+
+def chain_reasoning_and_tool_parsers(
+    *,
+    previous_text: str,
+    current_text: str,
+    delta_text: str,
+    reasoning_parser,
+    tool_parser,
+    state: _ToolChainState,
+) -> _ChainedDelta | None:
+    """Route a streaming delta through the reasoning parser, then the tool parser.
+
+    Ordering rationale: the reasoning parser strips ``<think>`` / ``</think>``
+    and splits a delta into reasoning vs content channels. Only the content
+    channel can possibly carry a ``<tool_call>`` block, so we feed the
+    reasoning parser's ``content`` output (not the raw ``delta_text``) into
+    the tool parser. When no reasoning parser is configured we treat the
+    entire delta as content, which preserves the pre-fix behaviour for
+    non-reasoning models.
+
+    Returns ``None`` when the chunk must be suppressed (e.g. the tag token
+    itself, or a delta that lands inside an incomplete ``<tool_call>``
+    block). Returns a ``_ChainedDelta`` otherwise; the caller must emit an
+    SSE chunk iff at least one field on the delta is non-empty.
+    """
+    # ---- Step 1: reasoning parser -----------------------------------
+    reasoning_out: str | None = None
+    content_for_tool: str | None
+
+    if reasoning_parser is not None and delta_text:
+        delta_msg = reasoning_parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text
+        )
+        if delta_msg is None:
+            # Reasoning parser swallowed this delta (e.g. <think> token).
+            return None
+        reasoning_out = delta_msg.reasoning
+        content_for_tool = delta_msg.content
+    else:
+        # No reasoning parser active: the raw delta is all content.
+        content_for_tool = delta_text
+
+    # ---- Step 2: tool parser ---------------------------------------
+    # If there is no tool parser, or nothing to feed it, return the
+    # reasoning-parser output unchanged.
+    if tool_parser is None or not content_for_tool:
+        if reasoning_out is None and not content_for_tool:
+            # Reasoning-only chunks are valid (content may legitimately be
+            # empty during the reasoning phase).
+            return _ChainedDelta(reasoning=reasoning_out)
+        return _ChainedDelta(
+            content=content_for_tool, reasoning=reasoning_out
+        )
+
+    # Fast path: if no ``<`` has been seen yet and the current delta
+    # contains none, we know the tool parser has nothing to do.
+    if not state.tool_markup_possible and "<" not in content_for_tool:
+        state.tool_accumulated_text += content_for_tool
+        return _ChainedDelta(
+            content=content_for_tool, reasoning=reasoning_out
+        )
+
+    if not state.tool_markup_possible:
+        state.tool_markup_possible = True
+
+    tool_previous = state.tool_accumulated_text
+    state.tool_accumulated_text += content_for_tool
+    tool_result = tool_parser.extract_tool_calls_streaming(
+        tool_previous, state.tool_accumulated_text, content_for_tool
+    )
+
+    if tool_result is None:
+        # Inside an incomplete <tool_call> block: suppress this chunk.
+        # Reasoning output from this same delta is also suppressed — it is
+        # invariant in this codebase that reasoning content never coexists
+        # with tool-call markup in the same delta.
+        return None
+
+    if "tool_calls" in tool_result:
+        state.tool_calls_detected = True
+        return _ChainedDelta(
+            tool_calls=list(tool_result["tool_calls"]),
+            reasoning=reasoning_out,
+        )
+
+    # Normal content path: the tool parser echoed the delta back, possibly
+    # trimmed. Prefer the parser's ``content`` value so any internal
+    # sanitisation is respected.
+    return _ChainedDelta(
+        content=tool_result.get("content", content_for_tool),
+        reasoning=reasoning_out,
+    )
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -1889,12 +2541,22 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # @CODE:LEGACY-THINK-TAGS/server-stream — per-stream state for the
+    # legacy-tag rewrite. ``legacy_think_started`` flips True when we emit
+    # the opening ``<think>\n`` marker (on the first reasoning delta);
+    # ``legacy_think_ended`` flips True when we emit the closing
+    # ``</think>\n`` marker (on the first content delta after thinking, or
+    # at stream end if the model never produced any post-thinking content).
+    legacy_think_started = False
+    legacy_think_ended = False
+
     # Tool call streaming state
+    # @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — shared state across both
+    # the reasoning-parser branch and the plain-text branch so the post-stream
+    # fallback below can still observe in-progress tool_call markup.
     global _tool_parser_instance
     tool_parser = None
-    tool_accumulated_text = ""
-    tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
+    tool_chain_state = _ToolChainState()
     if _enable_auto_tool_choice and _tool_call_parser:
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
@@ -1922,119 +2584,183 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
+        # @CODE:FIX-QWEN36-TOOL-CALL-STREAMING/server — unified chain path.
+        # Previously the reasoning-parser branch bypassed the tool parser, so
+        # Qwen3.6 streaming responses emitted raw ``<tool_call>`` XML in
+        # ``delta.content`` and never populated ``delta.tool_calls``. We now
+        # route every delta through ``chain_reasoning_and_tool_parsers`` so
+        # both parsers cooperate no matter which one is configured.
         if _reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, delta_text
-            )
-
-            if delta_msg is None:
-                # Skip this chunk (e.g., <think> token itself)
-                continue
-
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=request.model,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
-                        ),
-                        finish_reason=output.finish_reason if output.finished else None,
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
         else:
-            # Standard path without reasoning parsing
-            content = delta_text
+            previous_text = accumulated_text
+            accumulated_text = accumulated_text + (delta_text or "")
 
-            # Filter special tokens that may leak into streaming output
-            if content:
-                content = SPECIAL_TOKENS_PATTERN.sub("", content)
+        # Filter special tokens for the non-reasoning path. When a reasoning
+        # parser is active it already strips ``<think>`` / ``</think>``
+        # markup itself, so this extra sub() would be redundant (and risk
+        # double-stripping).
+        raw_delta = delta_text
+        if not _reasoning_parser and raw_delta:
+            raw_delta = SPECIAL_TOKENS_PATTERN.sub("", raw_delta)
 
-            # Add <think> prefix on first content chunk for thinking models
-            if is_thinking_model and not think_prefix_sent and content:
-                content = "<think>" + content
-                think_prefix_sent = True
+        # Add <think> prefix on first content chunk for thinking models
+        # (only applies when no reasoning parser is active).
+        if (
+            not _reasoning_parser
+            and is_thinking_model
+            and not think_prefix_sent
+            and raw_delta
+        ):
+            raw_delta = "<think>" + raw_delta
+            think_prefix_sent = True
 
-            # Tool call streaming parsing
-            if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
-                    )
+        chained = chain_reasoning_and_tool_parsers(
+            previous_text=previous_text,
+            current_text=accumulated_text,
+            delta_text=raw_delta,
+            reasoning_parser=_reasoning_parser,
+            tool_parser=tool_parser,
+            state=tool_chain_state,
+        )
 
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
+        if chained is None:
+            # Inside a partial <tool_call> block (or the reasoning parser
+            # swallowed a tag token). Either way, emit nothing for this
+            # delta unless the upstream engine just finished — in which
+            # case the post-stream fallback below takes over.
+            if output.finished:
+                # Still need to emit a terminating chunk so clients see
+                # ``finish_reason``. This matches pre-fix behaviour for
+                # the suppressed-chunk path.
+                finish_reason = (
+                    "tool_calls"
+                    if tool_chain_state.tool_calls_detected
+                    else output.finish_reason
+                )
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(),
+                            finish_reason=finish_reason,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
+                    ],
+                    usage=get_usage(output),
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            continue
 
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
+        # @CODE:LEGACY-THINK-TAGS/server-stream — when the legacy-tag shim is
+        # enabled, rewrite the ``chained`` delta so that reasoning text is
+        # folded into the ``content`` channel wrapped in ``<think>...</think>``
+        # and the ``reasoning`` channel is forced to None. Done BEFORE chunk
+        # construction so both the tool_calls branch and the regular content
+        # branch get consistent treatment.
+        delta_content_legacy: str | None
+        delta_reasoning_legacy: str | None
+        if _legacy_think_tags:
+            reasoning_part = chained.reasoning
+            content_part = chained.content
+            merged_parts: list[str] = []
+            if reasoning_part:
+                if not legacy_think_started:
+                    merged_parts.append("<think>\n")
+                    legacy_think_started = True
+                merged_parts.append(reasoning_part)
+            if content_part:
+                if legacy_think_started and not legacy_think_ended:
+                    merged_parts.append("</think>\n")
+                    legacy_think_ended = True
+                merged_parts.append(content_part)
+            delta_content_legacy = "".join(merged_parts) if merged_parts else None
+            delta_reasoning_legacy = None
+        else:
+            delta_content_legacy = (
+                chained.content if chained.content else None
+            )
+            delta_reasoning_legacy = chained.reasoning
 
+        if chained.tool_calls:
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=content if content else None
+                            content=delta_content_legacy
+                            if _legacy_think_tags
+                            else None,
+                            tool_calls=chained.tool_calls,
+                            reasoning=delta_reasoning_legacy,
                         ),
                         finish_reason=(
-                            "tool_calls"
-                            if (output.finished and tool_calls_detected)
-                            else (output.finish_reason if output.finished else None)
+                            "tool_calls" if output.finished else None
                         ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+            continue
+
+        finish_reason = (
+            "tool_calls"
+            if (output.finished and tool_chain_state.tool_calls_detected)
+            else (output.finish_reason if output.finished else None)
+        )
+        chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        content=delta_content_legacy,
+                        reasoning=delta_reasoning_legacy,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=get_usage(output) if output.finished else None,
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # @CODE:LEGACY-THINK-TAGS/server-stream — synthesize a closing
+    # ``</think>\n`` chunk if the stream ended while still inside a thinking
+    # block (i.e. the model produced reasoning but never any post-thinking
+    # content, so ``legacy_think_ended`` was never flipped). Without this
+    # the legacy client would render an unclosed ``<think>`` tag and fail to
+    # hide the thinking content.
+    if (
+        _legacy_think_tags
+        and legacy_think_started
+        and not legacy_think_ended
+    ):
+        legacy_think_ended = True
+        closing_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content="</think>\n"),
+                )
+            ],
+        )
+        yield f"data: {closing_chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
     # (e.g., </tool_call> never arrived - incomplete tool call)
     if (
         tool_parser
-        and tool_accumulated_text
-        and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
+        and tool_chain_state.tool_accumulated_text
+        and not tool_chain_state.tool_calls_detected
+        and "<tool_call>" in tool_chain_state.tool_accumulated_text
     ):
-        result = tool_parser.extract_tool_calls(tool_accumulated_text)
+        result = tool_parser.extract_tool_calls(
+            tool_chain_state.tool_accumulated_text
+        )
         if result.tools_called:
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2067,6 +2793,43 @@ async def stream_chat_completion(
     logger.info(
         f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
+
+    # @CODE:MEMORY-01/chatlog — Phase 3 fire-and-forget chat persistence
+    # for the streaming path. We use ``accumulated_text`` as the assistant
+    # text since it captures everything yielded across the stream
+    # (reasoning markers are stripped by the parser during accumulation
+    # in ``chain_reasoning_and_tool_parsers``). When the chat log is OFF
+    # this is a no-op and adds zero work to the SSE close path.
+    if _memory_enabled and _memory_chat_log_enabled:
+        try:
+            from .memory.chatlog import new_session_id  # noqa: PLC0415
+
+            assistant_for_persist = accumulated_text or ""
+            tool_calls_for_persist = None
+            if (
+                tool_chain_state.tool_calls_detected
+                and tool_chain_state.tool_accumulated_text
+            ):
+                # The streaming tool-call payloads are emitted via SSE
+                # but we don't keep a structured copy here; the text
+                # representation is sufficient for retrieval recall.
+                tool_calls_for_persist = [
+                    {"raw": tool_chain_state.tool_accumulated_text}
+                ]
+            _schedule_chat_persist(
+                request_id=response_id,
+                session_id=new_session_id(),
+                model=str(request.model),
+                messages=request.messages,
+                assistant_text=assistant_for_persist,
+                tool_calls=tool_calls_for_persist,
+                latency_ms=elapsed * 1000.0,
+            )
+        except Exception:  # noqa: BLE001 — REQ-N4
+            logger.exception(
+                "[memory] failed to schedule chat persist (streaming); "
+                "stream is unaffected"
+            )
 
     # Send final chunk with usage if requested
     if include_usage:
@@ -2169,6 +2932,18 @@ Examples:
         default=None,
         help="Path to MCP configuration file (JSON/YAML)",
     )
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject
+    parser.add_argument(
+        "--auto-inject-mcp-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Auto-inject MCP-registered tools into /v1/chat/completions "
+            "requests that do not provide their own 'tools' field. When the "
+            "request already has tools, MCP tools are merged (client tools "
+            "win on name collision). Default: off."
+        ),
+    )
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -2225,18 +3000,52 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--memory-headroom-gb",
+        type=float,
+        default=None,
+        help=(
+            "Minimum free-RAM headroom in GiB to keep available after the "
+            "model loads. The server logs a structured warning (but does "
+            "NOT exit) when free RAM drops below this target. Falls back "
+            "to MEMORY_HEADROOM_GB env var, then "
+            f"{DEFAULT_HEADROOM_GB:.1f} GiB."
+        ),
+    )
+    parser.add_argument(
+        "--memory-check-interval-s",
+        type=float,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=(
+            "Interval in seconds between periodic memory-headroom checks. "
+            f"Default: {DEFAULT_INTERVAL_SECONDS:.0f}s."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
     global _default_temperature, _default_top_p
+    global _memory_headroom_gb, _memory_check_interval_s
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+
+    # Memory-pressure guardrail config: CLI > env (MEMORY_HEADROOM_GB) > default.
+    _memory_headroom_gb = resolve_memory_headroom_gb_from_os(
+        cli_value=args.memory_headroom_gb,
+    )
+    if args.memory_check_interval_s is not None:
+        _memory_check_interval_s = float(args.memory_check_interval_s)
+    logger.info(
+        "Memory-pressure guardrail: headroom=%.2f GiB, interval=%.1fs",
+        _memory_headroom_gb,
+        _memory_check_interval_s,
+    )
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -2263,6 +3072,11 @@ Examples:
     # Set MCP config for lifespan
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — propagate flag + log status.
+    global _auto_inject_mcp_tools
+    _auto_inject_mcp_tools = bool(args.auto_inject_mcp_tools)
+    _log_mcp_auto_inject_status(_auto_inject_mcp_tools)
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:

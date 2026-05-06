@@ -19,8 +19,20 @@
       "url": "http://localhost:3001/sse",
       "enabled": false,
       "timeout": 60
+    },
+    "memory": {
+      "transport": "stdio",
+      "command": ".venv/bin/python",
+      "args": ["-m", "vllm_mlx.memory.server"],
+      "env": {
+        "MEMORY_ENABLED": "0",
+        "MEMORY_VAULT_PATH": "/Volumes/data/Obsidian/obsi",
+        "MEMORY_DB_PATH": "/Volumes/data/vllm-mlx-memory/memory.db"
+      },
+      "enabled": false,
+      "timeout": 30
     }
   },
-  "max_tool_calls": 10,
+  "max_tool_calls": 30,
   "default_timeout": 30.0
 }
