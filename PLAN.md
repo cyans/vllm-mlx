@@ -35,6 +35,16 @@ KV 양자화 자체에 대한 연구 산출물(회전 공간 어텐션, Needle �
 2. 이전에 축적한 KV 양자화 연구 산출물을 35B에 재활용한다.
 3. 메모리 가드레일이 안전망 역할을 한다 — TurboQuant는 그 위의 최적화 레이어.
 
+### 결론 (2026-05-06)
+
+Phase 3 스모크(짧은 프롬프트 + ~5K 롱컨텍스트, 커밋 `ad1426a`·`c34b783`)를 완료한 결과,
+**Qwen3.6-35B-A3B-4bit에서 TurboQuant는 가치를 입증하지 못했다.** 짧은 컨텍스트에서는 피크
+메모리가 +0.45 GB, ~5K 컨텍스트에서는 +1.62 GB 증가했고 두 케이스 모두 wall-clock이 2~4배
+악화되었다 — KV 압축이 도움이 되어야 할 바로 그 영역에서 메모리가 오히려 불어났다. 원인은
+이 모델 아키텍처에 있다(Phase 3의 진단 참고). 따라서 **Phase 4 서버 통합은 보류**한다.
+재평가 트리거는 (a) 활성 모델이 더 조밀한 self-attention 구조로 바뀌거나, (b) >32K 컨텍스트
+워크로드가 정착되어 메모리 산수가 뒤집힐 때다.
+
 ---
 
 ## 아키텍처 개요
@@ -191,7 +201,14 @@ python scripts/test_turbo_kv_small.py
 
 ---
 
-## Phase 3: 35B-A3B 스모크
+## Phase 3: 35B-A3B 스모크 (완료)
+
+**Commits:**
+- `ad1426a` — VL-checkpoint workaround included (`language_model.vision_tower.*` 가중치 필터 +
+  `strict=False` 로더). 기본 체크포인트가 멀티모달이라 일반 텍스트 LLM 진입로에서는 vision tower를
+  버려야 한다.
+- `c34b783` — long-context measurement comparable across both passes (`--long-context` 플래그로
+  baseline/Turbo 양쪽에 동일한 ~5K 입력을 흘려보냄).
 
 ### 목표
 
@@ -199,83 +216,81 @@ python scripts/test_turbo_kv_small.py
 안정성을 측정한다. Phase 2의 0.8B에서 검증된 패치 경로(self-attention 레이어만 교체, GatedDeltaNet
 유지)를 그대로 35B에 적용한다.
 
-### 사전 조건
+### 사전 조건 (충족됨)
 
 - Phase 1·2 완료 (mlx-optiq 설치, 0.8B 스모크 통과).
-- `mlx-community/Qwen3.6-35B-A3B-4bit` 모델 캐시 또는 다운로드 가능한 상태.
+- `mlx-community/Qwen3.6-35B-A3B-4bit` 모델 캐시 확보.
 
-### 테스트 스크립트 (저자 필요)
+### 테스트 스크립트
 
-**파일:** `scripts/test_turbo_kv_35b.py` *(아직 존재하지 않음 — Phase 3 착수 시 작성)*
+**파일:** `scripts/test_turbo_kv_35b.py` (커밋 `ad1426a`·`c34b783`)
 
-`scripts/test_turbo_kv_small.py`의 35B 카운터파트로 작성한다. 핵심 설계:
+핵심 구현:
 
-- **Baseline 패스**: `patch_attention()` 없이 모델을 1회 로드 → short / medium / long 프롬프트 순서로 생성.
+- **Baseline 패스**: `patch_attention()` 없이 모델을 1회 로드 → short / (선택) long_context 프롬프트 생성.
 - **TurboQuant 패스**: 모델 언로드 후 재로드 → `patch_attention()` 호출 → `make_prompt_cache` 결과의
   `KVCache` 슬롯만 `TurboQuantKVCache`로 교체. `ArraysCache`(GatedDeltaNet 슬롯)는 손대지 않는다.
-- **두 패스를 분리**하는 것이 중요하다. `patch_attention()`은 mlx-lm SDPA 전역 패치이므로 단일 로드에서
-  교차 실행하면 baseline이 오염된다.
+- **두 패스 분리**: `patch_attention()`이 mlx-lm SDPA 전역 패치이므로 단일 로드에서 교차 실행하면
+  baseline이 오염되기 때문에 패스마다 모델을 새로 로드한다.
+- **VL 체크포인트 우회**: 로드 래퍼가 `language_model.vision_tower.*` 가중치를 사전에 필터링하고
+  `strict=False`로 호출 — 텍스트 모드만 사용한다.
 - 메모리: `mx.get_active_memory()` / `mx.get_peak_memory()`.
-- 출력: 패치된 self-attention 레이어 수, head_dim, baseline vs TurboQuant 토큰/초·피크 메모리·생성
-  텍스트 샘플.
 
-### 메모리 친화적 스모크 (권장 첫 실행)
+### 결과
 
-35B는 0.8B보다 훨씬 큰 모델이므로 첫 실행은 다음과 같이 보수적으로 시작한다:
+**Run 1 — short prompt (64 tokens, 커밋 `ad1426a`)**
 
-```bash
-cd /Users/mac4/claude_apps/vllm-mlx
-source .venv/bin/activate
+| 측정 | Baseline | TurboQuant | Δ |
+|------|---------:|-----------:|--:|
+| Wall-clock | 14.54 s | 37.34 s | +156.8 % |
+| Throughput | 10.1 tok/s | 3.6 tok/s | -64 % |
+| Peak memory | 19.56 GB | 20.01 GB | +0.45 GB |
+| 패치된 self-attn 레이어 | — | 10 (head_dim=256) | — |
 
-# 1) 가장 짧은 스모크 — 한 프롬프트, 64 토큰만 생성
-python scripts/test_turbo_kv_35b.py --prompts short --max-tokens 64
+GatedDeltaNet `ArraysCache`는 양 패스 모두에서 의도대로 보존됨.
 
-# 2) 정상 작동 확인 후 표준 스모크
-python scripts/test_turbo_kv_35b.py 2>&1 | tee test_turbo_kv_35b_results.txt
+**Run 2 — short + long_context (`--long-context` 500 repeats ≈ 5K input tokens, 100 generation tokens, 커밋 `c34b783`)**
 
-# 3) 롱컨텍스트(반복 문장) 확인 — TurboQuant 패스 끝에서만
-python scripts/test_turbo_kv_35b.py --turbo-only --long-context --prompts short --max-tokens 128
-```
+| 프롬프트 | 패스 | Wall-clock | Peak memory |
+|---------|-----|----------:|-----------:|
+| short (32 tok) | Baseline | 2.67 s | 19.56 GB |
+| short (32 tok) | TurboQuant | 11.14 s | 20.01 GB |
+| long_context (~5K tok) | Baseline | 32.56 s | 21.62 GB |
+| long_context (~5K tok) | TurboQuant | 77.37 s | 23.24 GB |
 
-### 기대 결과
+short 케이스 차이는 +317 % wall / +0.45 GB peak. long_context 차이는 +138 % wall / +1.62 GB peak.
+**long_context 두 패스 모두 생성 토큰 0개**가 반환되었다 — 반복적인 fox 프롬프트가 설정된 `<|im_end|>`
+EOS 패치를 즉시 트리거하기 때문에 위 숫자들은 사실상 prefill 비용만 측정한 것이다. 그런데 바로 그
+영역(긴 prefill)이 TurboQuant의 KV 압축이 빛을 발해야 하는 곳인데, 피크 메모리는 줄지 않고 도리어
+**올라갔다**.
 
-- 35B 모델 로딩 성공 (~22 GB 가중치).
-- TurboQuant 패치된 self-attention 레이어 수 ≈ 모델 config의 self-attn 레이어 수 (보통 24개 부근,
-  config로 변동).
-- 속도 오버헤드 ≤ 5% (0.8B의 +6.5%보다 모델 크기 효과로 더 좋아질 가능성).
-- 피크 메모리: TurboQuant on이 baseline보다 KV cache 분만큼 작거나 동일 컨텍스트에서 더 안정.
-- 생성 텍스트 품질 유지 (육안 검토).
+### 진단
 
-### 성공 기준
+Qwen3.6-35B-A3B에서 self-attention 레이어는 **약 10개**뿐이고 나머지는 GatedDeltaNet 선형
+어텐션 블록으로, 이들은 상태를 `ArraysCache`에 들고 있어 `patch_attention()`이 손대지 않는다.
+그 결과 TurboQuant가 압축할 수 있는 절대적인 KV 양은 작다(5K 컨텍스트 기준 수백 MB 단위). 반면
+mlx-optiq는 회전 어텐션 활성 버퍼와 토큰별 양자화 메타데이터를 추가로 들고 있어야 하는데, 이
+오버헤드가 KV 절감분을 초과한다. 결과적으로 이 스케일에서는 **메모리도 더 쓰고 wall-clock도 더
+느려지는** 그림이 나온다 — 어떤 운용 시나리오에도 도움이 되지 않는다.
 
-- [ ] `scripts/test_turbo_kv_35b.py` 작성 및 첫 실행 성공.
-- [ ] 35B 모델에서 `patch_attention()` + 슬롯 교체 정상 작동.
-- [ ] 두 패스 분리 후 baseline 오염 없음.
-- [ ] 속도 오버헤드 5% 이내.
-- [ ] 피크 메모리 측정값이 PLAN 예산표(±2 GB)와 일치.
-- [ ] 32K 입력에서 OOM 없이 생성 완료 (가드레일 `--memory-headroom-gb 6` 기본값 준수).
-
-### 문제 해결
-
-**모델 레이어 구조 확인이 필요할 때:**
-
-```bash
-python -c "
-from mlx_lm import load
-model, _ = load('mlx-community/Qwen3.6-35B-A3B-4bit')
-for i, layer in enumerate(model.layers[:5]):
-    print(f'Layer {i}: {type(layer).__name__}')
-    for name, child in layer.named_children():
-        print(f'  {name}: {type(child).__name__}')
-"
-```
-
-**메모리 부족이 의심될 때:** `--max-tokens`를 줄이고, `MEMORY_HEADROOM_GB`를 8 정도로 올려 가드레일이
-먼저 작동하는지 확인.
+이 결론은 Phase 4 서버 통합의 비용을 정당화할 수 없다는 의미이며, 다음 절의 보류 결정으로 이어진다.
 
 ---
 
-## Phase 4: vllm-mlx 서버 통합
+## Phase 4: vllm-mlx 서버 통합 (보류)
+
+> **🛑 PAUSE — 2026-05-06**
+>
+> Phase 3의 35B 스모크에서 TurboQuant가 짧은/롱 컨텍스트 모두 피크 메모리를 늘리고 wall-clock을
+> 악화시킨다는 사실이 확인되었다(상세 표·진단은 Phase 3 절 참고). 이 상태에서 서버 통합 비용을
+> 회수할 방법이 없으므로 **Phase 4 작업은 보류**한다. 아래 기술 설계는 향후 부활을 대비해 그대로
+> 보존한다.
+>
+> **재평가 트리거 (둘 중 하나 충족 시 재개 검토):**
+> 1. 운용 모델이 더 조밀한 self-attention 아키텍처(GatedDeltaNet 비중 ↓, self-attn 레이어 비중 ↑)로
+>    바뀌어 TurboQuant가 압축할 수 있는 KV의 절대량이 충분히 커질 때.
+> 2. 정상 워크로드가 >32K 컨텍스트를 일상적으로 요구하기 시작해, KV 양자화의 메모리 산수가
+>    오버헤드를 능가할 만큼 뒤집힐 때.
 
 > 원 PLAN의 §5 기술 설계를 그대로 이어받되, 모델 가정을 35B로 변경하고 대형 모델 64GB 캐비어트를
 > 제거한다.
@@ -389,6 +404,6 @@ pip install -e .                  # 원래 의존성 복원
 
 ---
 
-> 작성일: 2026-05-05 (재작성)
+> 작성일: 2026-05-06 (재작성)
 > 대상 환경: Apple Silicon M4 Pro 64GB, macOS 26.3.1
-> 상태: Phase 1·2 완료, Phase 3 다음 단계
+> 상태: Phase 1·2·3 완료, Phase 4 보류 (TurboQuant 가치 미입증)
