@@ -16,7 +16,6 @@ These tests exercise:
 
 from __future__ import annotations
 
-import struct
 
 import pytest
 

@@ -23,10 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import replace
-from datetime import datetime, timezone
 
-import pytest
 
 from vllm_mlx.memory.chatlog import (
     new_session_id,
