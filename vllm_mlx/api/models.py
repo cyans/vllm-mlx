@@ -174,6 +174,8 @@ class ChatCompletionRequest(BaseModel):
     video_max_frames: int | None = None
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # OpenAI/vLLM 호환 채팅 템플릿 변수 전달 (예: enable_thinking=False 로 Qwen3 thinking 비활성화)
+    chat_template_kwargs: dict | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -298,6 +300,8 @@ class MCPToolsResponse(BaseModel):
 
     tools: list[MCPToolInfo]
     count: int
+    # 클라이언트가 도구 호출 루프 상한으로 참고할 수 있는 값 (mcp.json의 max_tool_calls)
+    max_tool_calls: int = 30
 
 
 class MCPServerInfo(BaseModel):

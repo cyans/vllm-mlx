@@ -391,11 +391,23 @@ class SimpleEngine(BaseEngine):
             if template_tools:
                 template_kwargs["tools"] = template_tools
 
+            # 클라이언트 요청의 chat_template_kwargs가 enable_thinking을 주면 우선 적용
+            client_kwargs = kwargs.get("chat_template_kwargs") or {}
+            if "enable_thinking" in client_kwargs:
+                template_kwargs["enable_thinking"] = client_kwargs["enable_thinking"]
+            # 나머지 클라이언트 키들도 병합 (enable_thinking은 이미 처리됨)
+            template_kwargs.update(
+                {k: v for k, v in client_kwargs.items() if k != "enable_thinking"}
+            )
+
             try:
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:
-                # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking"]:
+                # Some templates don't support all kwargs.
+                # 기본 키와 클라이언트가 보낸 키 모두 제거 후 재시도 (template 미지원 시).
+                keys_to_remove = ["tools", "enable_thinking"]
+                keys_to_remove.extend((kwargs.get("chat_template_kwargs") or {}).keys())
+                for key in keys_to_remove:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)

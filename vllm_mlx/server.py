@@ -60,11 +60,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+
 # @CODE:FIX-QWEN36-RUNTIME/mcp-auto-inject — thin re-exports. The real
 # implementations live in vllm_mlx.api.mcp_inject so they can be imported
 # and tested without the mlx / metal-heavy engine side of this module.
 from .api.mcp_inject import (
     log_mcp_auto_inject_status as _log_mcp_auto_inject_status,
+)
+from .api.mcp_inject import (
     resolve_effective_tools as _resolve_effective_tools,
 )
 from .api.models import (
@@ -110,7 +113,9 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
-from .config.models import resolve_tool_parser  # noqa: F401 — @CODE:MIGRATE-QWEN36/server
+from .config.models import (
+    resolve_tool_parser,  # noqa: F401 — @CODE:MIGRATE-QWEN36/server
+)
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .memory.budget import (
     DEFAULT_HEADROOM_GB,
@@ -1816,6 +1821,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
     if effective_tools:
         chat_kwargs["tools"] = convert_tools_for_template(effective_tools)
+
+    # 채팅 템플릿 변수(enable_thinking 등)를 엔진으로 전달
+    if request.chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = request.chat_template_kwargs
 
     if request.stream:
         return StreamingResponse(

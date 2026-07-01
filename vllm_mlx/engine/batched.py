@@ -22,6 +22,43 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+def _ensure_system_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Jinja chat template 요구사항: system 메시지는 반드시 맨 앞에 있어야 함.
+    system이 여러 개거나 중간에 있으면 하나로 합쳐서 맨 앞에 둠.
+    """
+    if not messages:
+        return messages
+    system_parts = []
+    rest = []
+    for m in messages:
+        if not isinstance(m, dict):
+            rest.append(m)
+            continue
+        role = m.get("role", "")
+        if role == "system":
+            content = m.get("content", "")
+            if isinstance(content, list):
+                text = " ".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                )
+            else:
+                text = str(content) if content else ""
+            if text:
+                system_parts.append(text)
+        else:
+            rest.append(m)
+    # system이 하나도 없는데 템플릿이 "system must be at the beginning"을 요구할 수 있음 → 빈 system을 맨 앞에 추가
+    if not system_parts:
+        first_role = messages[0].get("role", "") if messages and isinstance(messages[0], dict) else ""
+        if first_role != "system":
+            return [{"role": "system", "content": ""}] + list(messages)
+        return list(messages)
+    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+    return [merged_system] + rest
+
+
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     """
     Extract images and videos from OpenAI-format messages.
@@ -335,6 +372,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        chat_template_kwargs: dict | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -358,6 +396,8 @@ class BatchedEngine(BaseEngine):
             template_applicator = self.tokenizer
 
         if template_applicator is not None:
+            # Jinja 템플릿: system 메시지는 반드시 맨 앞에 있어야 함 (툴 대화 등으로 순서가 어긋날 수 있음)
+            messages = _ensure_system_first(messages)
             # Convert OpenAI image_url content parts to HuggingFace format
             # so the processor can insert the correct vision placeholder tokens.
             if self._is_mllm and num_images > 0:
@@ -370,14 +410,24 @@ class BatchedEngine(BaseEngine):
             if tools:
                 template_kwargs["tools"] = tools
 
+            # 클라이언트가 명시적으로 보낸 템플릿 변수만 병합 (미전달 시 기존 동작 유지)
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
+
             try:
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept certain kwargs; retry without unsupported keys.
+                # Remove both 'tools' and client-provided keys like 'enable_thinking' if unsupported.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
+                # 기본적으로 제거할 키들
+                keys_to_remove = ["tools"]
+                # 클라이언트가 보낸 키들도 제거 대상에 추가 (template이 지원하지 않을 경우)
+                if chat_template_kwargs:
+                    keys_to_remove.extend(chat_template_kwargs.keys())
+                for key in keys_to_remove:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 return template_applicator.apply_chat_template(
@@ -626,6 +676,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
         )
 
         return await self.generate(
@@ -737,6 +788,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
         )
 
         # Compute prefix boundary for cache

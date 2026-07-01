@@ -105,6 +105,59 @@ print(f"\n\nFinal reasoning: {reasoning_text}")
 print(f"Final answer: {content_text}")
 ```
 
+## Controlling Thinking with `enable_thinking`
+
+Qwen3 series models generate reasoning (thinking) content by default. You can disable thinking mode using `chat_template_kwargs.enable_thinking=False` to switch to instruct mode, which provides faster responses and saves tokens.
+
+### When to Disable Thinking
+
+Disable thinking mode when you need:
+- Faster response times
+- Token conservation for simple queries
+- Direct answers without intermediate reasoning
+- Avoiding interference with tool calls or code generation
+
+### Using with OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+
+# Disable thinking (instruct mode)
+response = client.chat.completions.create(
+    model="mlx-community/Qwen3.6-35B-A3B-4bit",
+    messages=[{"role": "user", "content": "Summarize this in one sentence."}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+message = response.choices[0].message
+print(message.content)  # Final answer only
+# message.reasoning is None, no reasoning tokens generated
+```
+
+### Using with Raw HTTP (requests library)
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+        "messages": [{"role": "user", "content": "..."}],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+)
+```
+
+### Important Notes
+
+- **Default behavior**: If `enable_thinking` is not specified, thinking mode remains enabled (backward compatible)
+- **To enable thinking**: Simply omit the parameter or set it to `true`
+- **MLLM support**: This parameter works identically for vision models like Qwen3-VL
+- **Token savings**: Disabling thinking can reduce token usage by 30-50% for simple queries
+
 ## Supported Parsers
 
 ### Qwen3 Parser (`qwen3`)
