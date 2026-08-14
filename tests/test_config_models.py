@@ -223,7 +223,7 @@ class TestResolveReasoningParser:
 
     def test_selects_qwen36_for_qwen36_model_id(self) -> None:
         # REQ-U6: the 3.6 quant id must auto-select the new qwen36 parser
-        # so ``start-server-qwen36.sh`` picks it up without a manual flag.
+        # so ``start-server.sh`` picks it up without a manual flag.
         assert (
             resolve_reasoning_parser("mlx-community/Qwen3.6-35B-A3B-4bit")
             == "qwen36"

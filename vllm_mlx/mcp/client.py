@@ -5,6 +5,7 @@ MCP client for connecting to individual MCP servers.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -137,10 +138,18 @@ class MCPClient:
             f"{self.config.command} {' '.join(self.config.args or [])}"
         )
 
+        # Merge custom env with parent environment to ensure subprocess
+        # inherits all necessary vars (PATH, HOME, etc.) plus custom ones.
+        # The MCP SDK's get_default_environment() only passes a limited set;
+        # passing the full merged env ensures tools like npx work correctly.
+        merged_env = None
+        if self.config.env:
+            merged_env = {**os.environ, **self.config.env}
+
         server_params = StdioServerParameters(
             command=self.config.command,
             args=self.config.args or [],
-            env=self.config.env,
+            env=merged_env,
         )
 
         # Create stdio client context

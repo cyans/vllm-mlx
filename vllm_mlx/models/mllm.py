@@ -1082,7 +1082,7 @@ class MLXMultimodalLM:
                     if isinstance(item, dict):
                         item_type = item.get("type", "")
 
-                        if item_type == "text":
+                        if item_type in ("text", "input_text"):
                             msg_text += item.get("text", "")
 
                         elif item_type == "image_url":
@@ -1443,7 +1443,7 @@ class MLXMultimodalLM:
                     if isinstance(item, dict):
                         item_type = item.get("type", "")
 
-                        if item_type == "text":
+                        if item_type in ("text", "input_text"):
                             msg_text += item.get("text", "")
 
                         elif item_type == "image_url":

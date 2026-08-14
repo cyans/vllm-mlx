@@ -136,7 +136,7 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
             raise ValueError(f"Invalid config for server '{name}': {e}")
 
     # Validate other fields
-    max_tool_calls = data.get("max_tool_calls", 10)
+    max_tool_calls = data.get("max_tool_calls", 30)
     if not isinstance(max_tool_calls, int) or max_tool_calls < 1:
         raise ValueError("'max_tool_calls' must be a positive integer")
 
@@ -180,7 +180,7 @@ def create_example_config() -> str:
                 "enabled": True,
             },
         },
-        "max_tool_calls": 10,
+        "max_tool_calls": 30,
         "default_timeout": 30.0,
     }
     return json.dumps(example, indent=2)

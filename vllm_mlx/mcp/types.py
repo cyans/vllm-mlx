@@ -95,7 +95,7 @@ class MCPConfig:
     """Root configuration for MCP client."""
 
     servers: Dict[str, MCPServerConfig] = field(default_factory=dict)
-    max_tool_calls: int = 10
+    max_tool_calls: int = 30
     default_timeout: float = 30.0
 
     @classmethod
@@ -108,7 +108,7 @@ class MCPConfig:
 
         return cls(
             servers=servers,
-            max_tool_calls=data.get("max_tool_calls", 10),
+            max_tool_calls=data.get("max_tool_calls", 30),
             default_timeout=data.get("default_timeout", 30.0),
         )
 

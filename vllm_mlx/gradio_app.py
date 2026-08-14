@@ -23,6 +23,24 @@ from pathlib import Path
 import gradio as gr
 import requests
 
+MAX_HISTORY_MESSAGES = 6
+MAX_TEXT_CHARS = 2000
+
+
+def _compact_text(text: str) -> str:
+    if len(text) <= MAX_TEXT_CHARS:
+        return text
+    return text[:MAX_TEXT_CHARS] + "\n...[truncated]"
+
+
+def _estimate_max_tokens(message_text: str, default_max_tokens: int) -> int:
+    text = (message_text or "").strip()
+    if len(text) < 32:
+        return min(default_max_tokens, 192)
+    if any(k in text.lower() for k in ("python", "javascript", "code", "구현", "코드")):
+        return min(default_max_tokens, 768)
+    return min(default_max_tokens, 384)
+
 
 def encode_file_to_base64(file_path: str) -> tuple[str, str]:
     """
@@ -145,8 +163,11 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         # Build messages list for API
         messages = []
 
-        # Process history - keep media content for multimodal context
-        for i, msg in enumerate(history):
+        # Process only recent history to reduce prompt prefill cost
+        recent_history = history[-MAX_HISTORY_MESSAGES:]
+        base_index = len(history) - len(recent_history)
+        for offset, msg in enumerate(recent_history):
+            i = base_index + offset
             if isinstance(msg, dict):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
@@ -155,7 +176,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                 if i in media_cache and role == "user":
                     # Rebuild multimodal content with cached media
                     if isinstance(content, str):
-                        rebuilt_content = [{"type": "text", "text": content}]
+                        rebuilt_content = [{"type": "text", "text": _compact_text(content)}]
                     elif isinstance(content, list):
                         # Extract just text parts
                         text_parts = [
@@ -164,12 +185,12 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                             if isinstance(p, dict) and p.get("type") == "text"
                         ]
                         rebuilt_content = (
-                            [{"type": "text", "text": " ".join(text_parts)}]
+                            [{"type": "text", "text": _compact_text(" ".join(text_parts))}]
                             if text_parts
                             else []
                         )
                     else:
-                        rebuilt_content = [{"type": "text", "text": str(content)}]
+                        rebuilt_content = [{"type": "text", "text": _compact_text(str(content))}]
 
                     # Add cached media
                     for media_item in media_cache[i]:
@@ -187,7 +208,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                         content = " ".join(text_parts)
                     elif isinstance(content, dict):
                         content = content.get("text", str(content))
-                    messages.append({"role": role, "content": content})
+                    messages.append({"role": role, "content": _compact_text(str(content))})
 
         # Build current message content and cache media
         current_content = build_message_content(text, files if files else None)
@@ -226,7 +247,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                 json={
                     "model": "default",
                     "messages": messages,
-                    "max_tokens": max_tokens,
+                    "max_tokens": _estimate_max_tokens(text, max_tokens),
                     "temperature": temperature,
                 },
                 timeout=600,
@@ -311,7 +332,7 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
         def text_chat(message: str, history: list) -> str:
             """Process a text-only message."""
             messages = []
-            for msg in history:
+            for msg in history[-MAX_HISTORY_MESSAGES:]:
                 if isinstance(msg, dict):
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
@@ -322,7 +343,7 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
                             if isinstance(p, dict) and p.get("type") == "text"
                         ]
                         content = " ".join(text_parts)
-                    messages.append({"role": role, "content": content})
+                    messages.append({"role": role, "content": _compact_text(str(content))})
 
             messages.append({"role": "user", "content": message})
 
@@ -332,7 +353,7 @@ Note: Make sure the vllm-mlx server is running with a multimodal model:
                     json={
                         "model": "default",
                         "messages": messages,
-                        "max_tokens": args.max_tokens,
+                        "max_tokens": _estimate_max_tokens(message, args.max_tokens),
                         "temperature": args.temperature,
                     },
                     timeout=120,

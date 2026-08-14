@@ -331,7 +331,9 @@ class TestLauncherEnvPassthrough:
     with a stubbed ``exec`` built-in that echoes its arguments.
     """
 
-    LAUNCHERS = ("start-server.sh", "start-server-qwen36.sh")
+    # Note (2026-04-27): start-server-qwen36.sh has been consolidated into
+    # start-server.sh, so only the canonical launcher is exercised here.
+    LAUNCHERS = ("start-server.sh",)
 
     @pytest.mark.parametrize("launcher", LAUNCHERS)
     def test_launcher_syntax_valid(self, launcher):

@@ -21,6 +21,24 @@ import argparse
 import gradio as gr
 import requests
 
+MAX_HISTORY_MESSAGES = 6
+MAX_MESSAGE_CHARS = 2000
+
+
+def _compact_content(content: str) -> str:
+    if len(content) <= MAX_MESSAGE_CHARS:
+        return content
+    return content[:MAX_MESSAGE_CHARS] + "\n...[truncated]"
+
+
+def _estimate_max_tokens(message: str, default_max_tokens: int) -> int:
+    text = message.strip()
+    if len(text) < 32:
+        return min(default_max_tokens, 192)
+    if any(k in text.lower() for k in ("python", "javascript", "code", "구현", "코드")):
+        return min(default_max_tokens, 768)
+    return min(default_max_tokens, 384)
+
 
 def create_chat_function(server_url: str, max_tokens: int, temperature: float):
     """
@@ -49,8 +67,8 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         # Build messages list for API
         messages = []
 
-        # Add history
-        for msg in history:
+        # Keep only recent history to reduce prompt prefill cost
+        for msg in history[-MAX_HISTORY_MESSAGES:]:
             if isinstance(msg, dict):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
@@ -62,7 +80,9 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                         if isinstance(p, dict) and p.get("type") == "text"
                     ]
                     content = " ".join(text_parts)
-                messages.append({"role": role, "content": content})
+                if not isinstance(content, str):
+                    content = str(content)
+                messages.append({"role": role, "content": _compact_content(content)})
 
         # Add current message
         messages.append({"role": "user", "content": message})
@@ -74,7 +94,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
                 json={
                     "model": "default",
                     "messages": messages,
-                    "max_tokens": max_tokens,
+                    "max_tokens": _estimate_max_tokens(message, max_tokens),
                     "temperature": temperature,
                 },
                 timeout=120,

@@ -14,12 +14,12 @@ tests and documentation generators that must not trigger a 20 GB
 download.
 
 Usage:
-    1. Start server (Phase 2 launcher, text-only):
-       ./start-server-qwen36.sh
+    1. Start server (canonical launcher, Qwen3.6 by default):
+       ./start-server.sh
 
        or explicitly:
        vllm-mlx serve $(python -c 'from vllm_mlx.config.models import QWEN36_PROFILE; print(QWEN36_PROFILE.model_id)') \\
-           --language-model-only --port 8001
+           --port 8001
 
     2. Run this example:
        python examples/test_qwen36_mllm.py

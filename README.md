@@ -69,6 +69,23 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
 ```
 
+### 외부/같은 네트워크에서 접속 (LAN)
+
+다른 컴퓨터에서 이 서버를 쓰려면:
+
+1. **서버는 `--host 0.0.0.0`으로 실행** (기본값이므로 생략 가능). `start-server.sh`에는 이미 포함되어 있음.
+2. **서버가 돌아가는 Mac의 IP 확인** (같은 네트워크 기준):
+   ```bash
+   # macOS
+   ipconfig getifaddr en0
+   # 또는
+   ifconfig | grep "inet " | grep -v 127.0.0.1
+   ```
+   예: `192.168.0.10`
+3. **다른 기기에서 접속 주소**: `http://192.168.0.10:8001` (포트는 `--port` 값에 맞춤).
+4. **방화벽**: macOS 시스템 설정 → 방화벽에서 8001 포트 허용 또는 터미널 앱 허용.
+5. **보안**: 집/사무실 밖에서 접속할 계획이면 `--api-key` 사용 권장.
+
 ### Use with OpenAI SDK
 
 ```python

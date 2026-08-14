@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QWEN36_PROFILE`, `PROFILES`).
 - `start-server-qwen36.sh` — opt-in launcher for Qwen3.6 (retained post-cutover
   as a convenience; `start-server.sh` now uses the same default).
+  *(Consolidated into `start-server.sh` on 2026-04-27; the dedicated launcher
+  was retired because its `--language-model-only` flag was never wired into
+  `vllm_mlx/server.py`.)*
 - `examples/test_qwen36_mllm.py` — text-only smoke test example for Qwen3.6.
 
 ### Rollback

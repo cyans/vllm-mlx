@@ -53,12 +53,44 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
     try:
         return load(model_name, tokenizer_config=tokenizer_config)
     except ValueError as e:
+        err_msg = str(e)
         # Fallback for models with non-standard tokenizers
-        if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
+        if "TokenizersBackend" in err_msg or "Tokenizer class" in err_msg:
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
             return _load_with_tokenizer_fallback(model_name)
-        else:
-            raise
+        # Fallback for checkpoints that include extra weights (e.g. vision_tower) not in text-only model
+        if "parameters not in model" in err_msg or "not in model" in err_msg:
+            logger.warning(
+                "Weights contain extra parameters (e.g. vision) not in text model; "
+                "loading with strict=False to use text-only part."
+            )
+            return _load_with_strict_false(model_name, tokenizer_config)
+        raise
+
+
+def _load_with_strict_false(model_name: str, tokenizer_config: dict):
+    """
+    Load model with strict=False so extra weights (e.g. vision_tower) in the
+    checkpoint are ignored. Use for text-only inference when the HF repo
+    contains both text and vision weights.
+    """
+    from mlx_lm.utils import load_model, load_tokenizer
+
+    local_path = Path(model_name)
+    if local_path.is_dir():
+        model_path = local_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        model_path = Path(snapshot_download(model_name))
+
+    model, config = load_model(model_path, lazy=False, strict=False)
+    tokenizer = load_tokenizer(
+        model_path,
+        tokenizer_config or {},
+        eos_token_ids=config.get("eos_token_id"),
+    )
+    return model, tokenizer
 
 
 def _load_with_tokenizer_fallback(model_name: str):
