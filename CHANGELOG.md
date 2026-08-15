@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Default model flipped from Qwen3.6-35B-A3B to Qwen3.8-27B (dense VLM).**
+  The server now loads `mlx-community/Qwen3.8-27B-4bit` (~15 GB) by default.
+  Qwen3.8-27B is a dense model with a native vision encoder — token
+  generation is slower per token than the A3B MoE quants (27B active vs 3B
+  active) but single-request quality on agentic coding tasks is substantially
+  higher (SWE-bench Pro 53.5 → 61.7, Terminal Bench 63.4 → 73.0 per the
+  Qwen3.8 model card). Reasoning format (`<think>...</think>`) and
+  tool-call format are unchanged, so the existing `qwen36` reasoning parser
+  and `qwen3_coder` tool parser carry over as-is. See SPEC-MIGRATE-QWEN38.
+
+### Added
+- `QWEN38_PROFILE` registered in `vllm_mlx.config.models.PROFILES` with
+  official 3.8 sampling defaults, including the new instruct-mode
+  `presence_penalty=1.5` recommendation (`SamplingDefaults.presence_penalty`,
+  default `0.0` — additive metadata, older profiles unaffected).
+- `EOS_PATCH_MODEL_PATTERNS` extended to `("qwen3.5", "qwen3.6", "qwen3.8")`.
+- `resolve_reasoning_parser` maps `qwen3.8` model ids to the shared `qwen36`
+  parser (identical `<think>` format).
+
+### Rollback
+- Operators preferring Qwen3.6 can set the `VLLM_MLX_MODEL_ID` environment
+  variable to override the default:
+  ```
+  VLLM_MLX_MODEL_ID=mlx-community/Qwen3.6-35B-A3B-4bit ./start-server.sh
+  ```
+  `LEGACY_MODEL_ID` now points at the Qwen3.6 quant (one-step rollback);
+  `QWEN35_PROFILE` / `QWEN36_PROFILE` hold their own literal ids.
 - **Default model flipped from Qwen3.5-35B-A3B to Qwen3.6-35B-A3B.**
   `./start-server.sh` now loads `mlx-community/Qwen3.6-35B-A3B-4bit` by default.
   First-time invocation will download ~20.4 GB of MLX-quantized weights.

@@ -24,7 +24,22 @@ Phase 3 changes locked in by this suite:
 * ``resolve_model_id`` without an override returns the Qwen3.6 quant.
 * Setting ``VLLM_MLX_MODEL_ID=LEGACY_MODEL_ID`` restores Qwen3.5.
 
+Qwen3.8 migration (SPEC-MIGRATE-QWEN38) changes locked in by this suite:
+
+* :data:`~vllm_mlx.config.models.DEFAULT_MODEL_ID` is flipped from the
+  Qwen3.6 quant to the Qwen3.8-27B quant.
+* :data:`~vllm_mlx.config.models.LEGACY_MODEL_ID` moves forward to the
+  Qwen3.6 quant (one-step rollback handle).
+* :data:`~vllm_mlx.config.models.QWEN38_PROFILE` is registered in
+  :data:`~vllm_mlx.config.models.PROFILES`, and ``QWEN35_PROFILE`` /
+  ``QWEN36_PROFILE`` hold their own literal ids.
+* ``EOS_PATCH_MODEL_PATTERNS`` is extended to the versioned triple
+  ``("qwen3.5", "qwen3.6", "qwen3.8")``.
+* ``resolve_reasoning_parser`` maps ``qwen3.8`` model ids to the shared
+  ``qwen36`` parser (identical ``<think>`` format).
+
 @TEST:MIGRATE-QWEN36
+@TEST:MIGRATE-QWEN38
 """
 
 from __future__ import annotations
@@ -41,6 +56,7 @@ from vllm_mlx.config.models import (
     PROFILES,
     QWEN35_PROFILE,
     QWEN36_PROFILE,
+    QWEN38_PROFILE,
     REASONING_PARSER,
     TOOL_PARSER_FALLBACK,
     TOOL_PARSER_PREFERRED,
@@ -56,20 +72,19 @@ from vllm_mlx.config.models import (
 # Module-level constants
 # ---------------------------------------------------------------------------
 class TestModelIdentifiers:
-    """Freeze the Phase 1 / Phase 2 model-identifier contract."""
+    """Freeze the Phase 1 / Phase 2 / Qwen3.8 model-identifier contract."""
 
-    def test_default_model_id_is_qwen36_after_phase3(self) -> None:
-        # REQ-U1 (Phase 3 cutover): DEFAULT_MODEL_ID is now the 3.6 quant.
-        # Duplicate of TestPhase3Cutover.test_default_model_id_is_qwen36
+    def test_default_model_id_is_qwen38_after_cutover(self) -> None:
+        # REQ (Qwen3.8 cutover): DEFAULT_MODEL_ID is now the 3.8 quant.
+        # Duplicate of TestQwen38Cutover.test_default_model_id_is_qwen38
         # kept here so TestModelIdentifiers remains a complete snapshot of
         # the module-level identifier contract.
-        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
+        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.8-27B-4bit"
 
-    def test_legacy_model_id_stays_on_qwen35(self) -> None:
-        # Phase 3 invariant: LEGACY_MODEL_ID remains pinned to the 3.5
-        # quant and now diverges from DEFAULT_MODEL_ID. This is the
-        # rollback handle documented in CHANGELOG.md.
-        assert LEGACY_MODEL_ID == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    def test_legacy_model_id_moves_to_qwen36(self) -> None:
+        # Qwen3.8 migration invariant: LEGACY_MODEL_ID moved forward to the
+        # 3.6 quant (one-step rollback) and diverges from DEFAULT_MODEL_ID.
+        assert LEGACY_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
         assert LEGACY_MODEL_ID != DEFAULT_MODEL_ID
 
     def test_reasoning_parser_is_qwen3(self) -> None:
@@ -81,11 +96,12 @@ class TestModelIdentifiers:
     def test_tool_parser_fallback_is_qwen(self) -> None:
         assert TOOL_PARSER_FALLBACK == "qwen"
 
-    def test_eos_patch_patterns_phase2_tightened(self) -> None:
-        # Phase 2 tightens the Phase 1 permissive ``("qwen3",)`` to an
-        # explicit pair of versioned substrings. Bare ``"qwen3"`` tokens
-        # (without ``.5`` or ``.6``) no longer trigger the EOS patch.
-        assert EOS_PATCH_MODEL_PATTERNS == ("qwen3.5", "qwen3.6")
+    def test_eos_patch_patterns_versioned_triple(self) -> None:
+        # Phase 2 tightened the Phase 1 permissive ``("qwen3",)`` to an
+        # explicit pair; the Qwen3.8 migration extends it to a versioned
+        # triple. Bare ``"qwen3"`` tokens (no ``.5`` / ``.6`` / ``.8``
+        # suffix) still do not trigger the EOS patch.
+        assert EOS_PATCH_MODEL_PATTERNS == ("qwen3.5", "qwen3.6", "qwen3.8")
 
     def test_eos_patch_patterns_is_tuple(self) -> None:
         # Immutability guard: must be a tuple, not a list.
@@ -116,6 +132,17 @@ class TestMatchesEosPatch:
         ],
     )
     def test_matches_eos_patch_qwen36_positive(self, model_id: str) -> None:
+        assert matches_eos_patch(model_id) is True
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "Qwen/Qwen3.8-27B",
+            "mlx-community/Qwen3.8-27B-4bit",
+            "QWEN3.8-PREVIEW",  # case-insensitive
+        ],
+    )
+    def test_matches_eos_patch_qwen38_positive(self, model_id: str) -> None:
         assert matches_eos_patch(model_id) is True
 
     @pytest.mark.parametrize(
@@ -229,6 +256,14 @@ class TestResolveReasoningParser:
             == "qwen36"
         )
 
+    def test_selects_qwen36_for_qwen38_model_id(self) -> None:
+        # Qwen3.8 migration: the 3.8 quant emits the same ``<think>``
+        # format as 3.6, so it shares the qwen36 parser.
+        assert (
+            resolve_reasoning_parser("mlx-community/Qwen3.8-27B-4bit")
+            == "qwen36"
+        )
+
     def test_selects_qwen3_for_qwen35_model_id(self) -> None:
         # REQ-N1 regression guard: the 3.5 quant id must keep resolving to
         # the unchanged ``qwen3`` parser so the live Qwen3.5 server is
@@ -273,6 +308,7 @@ class TestResolveReasoningParser:
         # Model id substring match is case-insensitive, matching
         # ``matches_eos_patch`` semantics.
         assert resolve_reasoning_parser("MLX-COMMUNITY/QWEN3.6-FOO") == "qwen36"
+        assert resolve_reasoning_parser("MLX-COMMUNITY/QWEN3.8-FOO") == "qwen36"
         assert resolve_reasoning_parser("Qwen/Qwen3.5-35B-A3B") == "qwen3"
 
     def test_bare_qwen3_resolves_to_qwen3(self) -> None:
@@ -311,17 +347,19 @@ class TestImmutability:
             QWEN35_PROFILE.max_context_tokens = 99  # type: ignore[misc]
 
     def test_profiles_contains_qwen35(self) -> None:
-        # Phase 3: QWEN35_PROFILE is keyed by LEGACY_MODEL_ID (the 3.5
-        # quant) now that DEFAULT_MODEL_ID has flipped to 3.6.
-        assert LEGACY_MODEL_ID in PROFILES
-        assert PROFILES[LEGACY_MODEL_ID] is QWEN35_PROFILE
+        # Qwen3.8 migration: LEGACY_MODEL_ID moved forward to the 3.6
+        # quant, so the 3.5 profile is now keyed by its own literal id
+        # (LEGACY no longer resolves to the 3.5 profile).
+        assert QWEN35_PROFILE.model_id in PROFILES
+        assert PROFILES[QWEN35_PROFILE.model_id] is QWEN35_PROFILE
 
     def test_qwen35_profile_fields_present(self) -> None:
         # Spot-check shape: all six top-level fields and both nested
         # SamplingDefaults instances are wired up.
-        # Phase 3: the 3.5 profile's model_id is LEGACY_MODEL_ID, not
-        # DEFAULT_MODEL_ID (DEFAULT now resolves to 3.6).
-        assert QWEN35_PROFILE.model_id == LEGACY_MODEL_ID
+        # Qwen3.8 migration: the 3.5 profile holds its own literal id —
+        # it no longer references LEGACY_MODEL_ID (which now points at
+        # the 3.6 quant).
+        assert QWEN35_PROFILE.model_id == "mlx-community/Qwen3.5-35B-A3B-4bit"
         assert isinstance(QWEN35_PROFILE.instruct, SamplingDefaults)
         assert isinstance(QWEN35_PROFILE.thinking, SamplingDefaults)
         assert QWEN35_PROFILE.max_context_tokens > 0
@@ -396,37 +434,102 @@ class TestQwen36Profile:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 cutover — DEFAULT_MODEL_ID flipped to Qwen3.6
+# QWEN38_PROFILE — Qwen3.8 migration addition
 # ---------------------------------------------------------------------------
-class TestPhase3Cutover:
-    """Phase 3 locks in the default flip from Qwen3.5 to Qwen3.6.
+class TestQwen38Profile:
+    """The Qwen3.8 migration locks in the 3.8 profile alongside the others.
 
-    @TEST:MIGRATE-QWEN36/phase3
+    @TEST:MIGRATE-QWEN38
     """
 
-    def test_default_model_id_is_qwen36(self) -> None:
-        # REQ-U1 (Phase 3): DEFAULT_MODEL_ID flips from 3.5 to 3.6.
-        assert QWEN36_PROFILE.model_id == DEFAULT_MODEL_ID
-        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
+    def test_qwen38_profile_present(self) -> None:
+        assert QWEN38_PROFILE.model_id == "mlx-community/Qwen3.8-27B-4bit"
+        assert QWEN38_PROFILE.max_context_tokens == 262_144
+        assert QWEN38_PROFILE.supports_tool_calling is True
+        # Qwen3.8-27B is a native vision-language model (dense, with a real
+        # vision encoder) — unlike the 3.5/3.6 A3B MoE quants whose
+        # ``supports_multimodal`` merely reflected special tokens.
+        assert QWEN38_PROFILE.supports_multimodal is True
 
-    def test_legacy_model_id_is_qwen35(self) -> None:
-        # Phase 3: LEGACY_MODEL_ID continues to point at the 3.5 quant for
-        # rollback via VLLM_MLX_MODEL_ID.
-        assert LEGACY_MODEL_ID == "mlx-community/Qwen3.5-35B-A3B-4bit"
+    def test_qwen38_profile_is_frozen(self) -> None:
+        with pytest.raises(FrozenInstanceError):
+            QWEN38_PROFILE.max_context_tokens = 99  # type: ignore[misc]
 
-    def test_legacy_differs_from_default_phase3(self) -> None:
-        # Phase 3 invariant: default and legacy diverge (3.6 vs 3.5).
+    def test_profiles_contains_all_three(self) -> None:
+        assert QWEN35_PROFILE.model_id in PROFILES
+        assert QWEN36_PROFILE.model_id in PROFILES
+        assert QWEN38_PROFILE.model_id in PROFILES
+        assert PROFILES[QWEN38_PROFILE.model_id] is QWEN38_PROFILE
+
+    def test_qwen38_thinking_defaults(self) -> None:
+        # Per HF model card "Thinking Mode":
+        # temperature=1.0, top_p=0.95, top_k=20, repetition_penalty=1.0.
+        thinking = QWEN38_PROFILE.thinking
+        assert thinking.temperature == 1.0
+        assert thinking.top_p == 0.95
+        assert thinking.top_k == 20
+        assert thinking.repetition_penalty == 1.0
+        assert thinking.max_tokens == 32_768
+
+    def test_qwen38_instruct_defaults(self) -> None:
+        # Per HF model card "Instruct (non-thinking) Mode":
+        # temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5,
+        # repetition_penalty=1.0. presence_penalty=1.5 is NEW in 3.8 —
+        # recommended to reduce endless repetition in non-thinking mode.
+        instruct = QWEN38_PROFILE.instruct
+        assert instruct.temperature == 0.7
+        assert instruct.top_p == 0.8
+        assert instruct.top_k == 20
+        assert instruct.repetition_penalty == 1.0
+        assert instruct.presence_penalty == 1.5
+        assert instruct.max_tokens == 32_768
+
+    def test_qwen38_sampling_sane_ranges(self) -> None:
+        for sd in (QWEN38_PROFILE.instruct, QWEN38_PROFILE.thinking):
+            assert 0.0 < sd.temperature <= 2.0
+            assert 0.0 < sd.top_p <= 1.0
+            assert sd.top_k > 0
+            assert sd.repetition_penalty >= 1.0
+            assert sd.max_tokens > 0
+
+    def test_presence_penalty_defaults_to_zero(self) -> None:
+        # Back-compat: profiles constructed without presence_penalty (all
+        # pre-3.8 profiles) read as 0.0 — the field is additive metadata.
+        assert QWEN35_PROFILE.instruct.presence_penalty == 0.0
+        assert QWEN36_PROFILE.instruct.presence_penalty == 0.0
+        assert QWEN36_PROFILE.thinking.presence_penalty == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.8 cutover — DEFAULT_MODEL_ID flipped to Qwen3.8
+# ---------------------------------------------------------------------------
+class TestQwen38Cutover:
+    """The Qwen3.8 migration locks in the default flip from Qwen3.6 to
+    Qwen3.8-27B.
+
+    @TEST:MIGRATE-QWEN38
+    """
+
+    def test_default_model_id_is_qwen38(self) -> None:
+        assert QWEN38_PROFILE.model_id == DEFAULT_MODEL_ID
+        assert DEFAULT_MODEL_ID == "mlx-community/Qwen3.8-27B-4bit"
+
+    def test_legacy_model_id_is_qwen36(self) -> None:
+        # Qwen3.8 migration: LEGACY_MODEL_ID moved forward to the 3.6
+        # quant (one-step rollback) via VLLM_MLX_MODEL_ID.
+        assert LEGACY_MODEL_ID == "mlx-community/Qwen3.6-35B-A3B-4bit"
+
+    def test_legacy_differs_from_default(self) -> None:
         assert LEGACY_MODEL_ID != DEFAULT_MODEL_ID
 
-    def test_resolve_model_id_default_is_qwen36(self) -> None:
-        # Explicit assertion: no env override => 3.6 quant is returned.
-        assert resolve_model_id({}) == "mlx-community/Qwen3.6-35B-A3B-4bit"
+    def test_resolve_model_id_default_is_qwen38(self) -> None:
+        assert resolve_model_id({}) == "mlx-community/Qwen3.8-27B-4bit"
 
-    def test_resolve_model_id_env_rollback_to_qwen35(self) -> None:
+    def test_resolve_model_id_env_rollback_to_qwen36(self) -> None:
         # Documented rollback path: operators set VLLM_MLX_MODEL_ID to
         # LEGACY_MODEL_ID to opt back into the previous generation.
         env = {"VLLM_MLX_MODEL_ID": LEGACY_MODEL_ID}
-        assert resolve_model_id(env) == "mlx-community/Qwen3.5-35B-A3B-4bit"
+        assert resolve_model_id(env) == "mlx-community/Qwen3.6-35B-A3B-4bit"
 
 
 # ---------------------------------------------------------------------------
@@ -446,3 +549,10 @@ class TestPackageExports:
         from vllm_mlx import config
 
         assert config.QWEN36_PROFILE is QWEN36_PROFILE
+
+    def test_config_package_reexports_qwen38(self) -> None:
+        # Qwen3.8 migration: QWEN38_PROFILE must be reachable via the
+        # package-level shortcut just like the other profiles.
+        from vllm_mlx import config
+
+        assert config.QWEN38_PROFILE is QWEN38_PROFILE

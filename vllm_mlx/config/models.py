@@ -15,9 +15,10 @@ The module supports three consumer patterns:
 3. Profile lookup for sampling defaults:
    ``profile = PROFILES[model_id]``
 
-Phase 1 keeps the Qwen3.5 quant as ``DEFAULT_MODEL_ID``. Phase 3 will flip
-the default to a Qwen3.6 identifier while ``LEGACY_MODEL_ID`` continues to
-point at the Qwen3.5 quant for rollback purposes.
+The Qwen3.6 migration (SPEC-MIGRATE-QWEN36) completed its Phase 3 cutover;
+the Qwen3.8 migration (SPEC-MIGRATE-QWEN38) subsequently flipped
+``DEFAULT_MODEL_ID`` to the Qwen3.8-27B quant while ``LEGACY_MODEL_ID``
+points at the Qwen3.6 quant for one-step rollback.
 """
 
 from __future__ import annotations
@@ -30,27 +31,30 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 # @CODE:MIGRATE-QWEN36/config
 # @CODE:MIGRATE-QWEN36/phase3 — Phase 3 cutover: DEFAULT flipped to Qwen3.6.
-# Note: this literal must stay in sync with ``QWEN36_PROFILE.model_id`` below.
-# Because ``QWEN36_PROFILE`` is defined after this constant, we cannot
-# reference it directly here without reordering the module. The module-level
-# ``assert`` after the profile block enforces that they never drift.
-DEFAULT_MODEL_ID: str = "mlx-community/Qwen3.6-35B-A3B-4bit"
+# @CODE:MIGRATE-QWEN38/config — Qwen3.8 cutover: DEFAULT flipped to Qwen3.8-27B
+# (dense VLM quant); LEGACY moved forward to the 3.6 quant as the one-step
+# rollback target. Note: this literal must stay in sync with
+# ``QWEN38_PROFILE.model_id`` below. Because ``QWEN38_PROFILE`` is defined
+# after this constant, we cannot reference it directly here without
+# reordering the module. The module-level ``assert`` after the profile block
+# enforces that they never drift.
+DEFAULT_MODEL_ID: str = "mlx-community/Qwen3.8-27B-4bit"
 """Active default model ID.
 
 Used when neither the ``VLLM_MLX_MODEL_ID`` environment variable nor an
-explicit CLI override is provided. Phase 3 flips this from the Qwen3.5
-quant to the Qwen3.6 quant. Operators can opt back into Qwen3.5 by setting
-``VLLM_MLX_MODEL_ID`` to :data:`LEGACY_MODEL_ID` or the literal id string.
+explicit CLI override is provided. The Qwen3.8 migration flipped this from
+the Qwen3.6 quant to the Qwen3.8-27B quant. Operators can opt back into
+Qwen3.6 by setting ``VLLM_MLX_MODEL_ID`` to :data:`LEGACY_MODEL_ID` or the
+literal id string.
 """
 
-LEGACY_MODEL_ID: str = "mlx-community/Qwen3.5-35B-A3B-4bit"
+LEGACY_MODEL_ID: str = "mlx-community/Qwen3.6-35B-A3B-4bit"
 """Previous-generation model ID retained for rollback.
 
-Phase 1 and Phase 2 had this equal to :data:`DEFAULT_MODEL_ID`. Phase 3
-diverges them: :data:`DEFAULT_MODEL_ID` becomes the Qwen3.6 quant while
-this constant continues to point at the Qwen3.5 quant. Set
-``VLLM_MLX_MODEL_ID`` to this value to opt back into the previous
-generation without editing launcher scripts.
+The Qwen3.6 Phase 3 cutover had this pointing at the Qwen3.5 quant; the
+Qwen3.8 migration moved it forward to the Qwen3.6 quant (the one-step
+rollback target). Set ``VLLM_MLX_MODEL_ID`` to this value to opt back into
+the previous generation without editing launcher scripts.
 """
 
 # ---------------------------------------------------------------------------
@@ -84,16 +88,17 @@ preferred parser. The ``qwen`` parser handles the classic
 # ---------------------------------------------------------------------------
 # EOS-patch substring patterns
 # ---------------------------------------------------------------------------
-EOS_PATCH_MODEL_PATTERNS: tuple[str, ...] = ("qwen3.5", "qwen3.6")
+EOS_PATCH_MODEL_PATTERNS: tuple[str, ...] = ("qwen3.5", "qwen3.6", "qwen3.8")
 """Substrings that, when present in a model id, trigger the ``<|im_end|>``
 EOS override documented in ``vllm_mlx/models/llm.py``.
 
-Phase 2 tightens the Phase 1 permissive ``("qwen3",)`` pattern to the
-explicit versioned pair ``("qwen3.5", "qwen3.6")``. Consequence: bare
-``"qwen3"`` tokens (for example ``Qwen/Qwen3-7B``) no longer trigger the
-EOS patch — the ``<|im_end|>`` override is specific to the 3.5 / 3.6
-tokenizer profile and should not silently be applied to future unrelated
-members of the Qwen3 family.
+Phase 2 tightened the Phase 1 permissive ``("qwen3",)`` pattern to the
+explicit versioned pair; the Qwen3.8 migration extends it to the versioned
+triple ``("qwen3.5", "qwen3.6", "qwen3.8")``. Consequence: bare
+``"qwen3"`` tokens (for example ``Qwen/Qwen3-7B``) do not trigger the
+EOS patch — the ``<|im_end|>`` override is specific to the 3.5 / 3.6 /
+3.8 tokenizer profile and should not silently be applied to future
+unrelated members of the Qwen3 family.
 
 Matching is case-insensitive and substring-based; see
 :func:`matches_eos_patch` for the comparison semantics.
@@ -112,6 +117,9 @@ class SamplingDefaults:
     top_k: int
     repetition_penalty: float
     max_tokens: int
+    # New in the Qwen3.8 migration: official 3.8 instruct-mode guidance
+    # recommends presence_penalty=1.5. Older profiles omit it and read 0.0.
+    presence_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -133,9 +141,12 @@ class ModelProfile:
 # Sources: https://github.com/QwenLM/Qwen2.5 README sampling section.
 QWEN35_PROFILE: ModelProfile = ModelProfile(
     # @CODE:MIGRATE-QWEN36/phase3 — Phase 3 flipped DEFAULT to 3.6, so the
-    # 3.5 profile must be bound to ``LEGACY_MODEL_ID`` (the 3.5 quant)
-    # rather than ``DEFAULT_MODEL_ID`` to preserve its identity.
-    model_id=LEGACY_MODEL_ID,
+    # 3.5 profile must hold its own literal id (previously it referenced
+    # ``LEGACY_MODEL_ID``) to preserve its identity. The Qwen3.8 migration
+    # later moved LEGACY forward to the 3.6 quant, which would have
+    # silently corrupted this profile's identity had it still been bound
+    # to the constant.
+    model_id="mlx-community/Qwen3.5-35B-A3B-4bit",
     instruct=SamplingDefaults(
         temperature=0.7,
         top_p=0.8,
@@ -186,26 +197,61 @@ QWEN36_PROFILE: ModelProfile = ModelProfile(
     supports_multimodal=True,
 )
 
+# Qwen3.8 Hugging-Face model-card defaults.
+# - Instruct (non-thinking) mode: temperature=0.7, top_p=0.8, top_k=20,
+#   presence_penalty=1.5 (new — recommended to reduce endless repetition
+#   in non-thinking mode), repetition_penalty=1.0.
+# - Thinking mode: temperature=1.0, top_p=0.95, top_k=20,
+#   repetition_penalty=1.0.
+# Max context per the 3.8 config is 262_144 tokens (extensible to 1M via
+# YaRN, out of scope here). Qwen3.8-27B is a DENSE model with a native
+# vision encoder — unlike the 3.5/3.6 A3B MoE quants — so
+# ``supports_multimodal=True`` now reflects a real vision tower; text-only
+# serving still opts in via ``--language-model-only``.
+QWEN38_PROFILE: ModelProfile = ModelProfile(
+    model_id="mlx-community/Qwen3.8-27B-4bit",
+    instruct=SamplingDefaults(
+        temperature=0.7,
+        top_p=0.8,
+        top_k=20,
+        repetition_penalty=1.0,
+        presence_penalty=1.5,
+        max_tokens=32_768,
+    ),
+    thinking=SamplingDefaults(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        repetition_penalty=1.0,
+        max_tokens=32_768,
+    ),
+    max_context_tokens=262_144,
+    supports_tool_calling=True,
+    supports_multimodal=True,
+)
+
 PROFILES: dict[str, ModelProfile] = {
     QWEN35_PROFILE.model_id: QWEN35_PROFILE,
     QWEN36_PROFILE.model_id: QWEN36_PROFILE,
+    QWEN38_PROFILE.model_id: QWEN38_PROFILE,
 }
 """Read-only map from model id to :class:`ModelProfile`.
 
-Phase 2 registers both the Qwen3.5 and Qwen3.6 profiles so callers can
-look up sampling defaults and capability flags for either quant without
-conditional logic. Phase 3 flips :data:`DEFAULT_MODEL_ID` to the 3.6
-entry; :data:`LEGACY_MODEL_ID` continues to point at the 3.5 entry
-for rollback.
+Phase 2 of the 3.6 migration registered the Qwen3.5 and Qwen3.6 profiles
+so callers can look up sampling defaults and capability flags for either
+quant without conditional logic. The Qwen3.8 migration adds the 3.8
+profile and flips :data:`DEFAULT_MODEL_ID` to it;
+:data:`LEGACY_MODEL_ID` points at the 3.6 entry for rollback.
 """
 
 # @CODE:MIGRATE-QWEN36/phase3 — Module-level coupling guard.
-# ``DEFAULT_MODEL_ID`` is defined as a literal (before ``QWEN36_PROFILE``
+# @CODE:MIGRATE-QWEN38/config — retargeted to the 3.8 profile.
+# ``DEFAULT_MODEL_ID`` is defined as a literal (before ``QWEN38_PROFILE``
 # exists), so this assertion pins the two together and fails import-time
 # if a future edit breaks the invariant.
-assert QWEN36_PROFILE.model_id == DEFAULT_MODEL_ID, (
-    "DEFAULT_MODEL_ID must equal QWEN36_PROFILE.model_id "
-    f"(got {DEFAULT_MODEL_ID!r} vs {QWEN36_PROFILE.model_id!r})"
+assert QWEN38_PROFILE.model_id == DEFAULT_MODEL_ID, (
+    "DEFAULT_MODEL_ID must equal QWEN38_PROFILE.model_id "
+    f"(got {DEFAULT_MODEL_ID!r} vs {QWEN38_PROFILE.model_id!r})"
 )
 
 
@@ -266,7 +312,7 @@ def resolve_reasoning_parser(
        when present and non-empty. Matches the "unset = empty string"
        shell convention used by :func:`resolve_model_id`.
     2. Model-id pattern match (case-insensitive substring):
-       * ``"qwen3.6"`` → ``"qwen36"``
+       * ``"qwen3.6"`` or ``"qwen3.8"`` → ``"qwen36"``
        * ``"qwen3.5"`` or bare ``"qwen3"`` → ``"qwen3"``
     3. Module-level :data:`REASONING_PARSER` default.
 
@@ -284,11 +330,13 @@ def resolve_reasoning_parser(
     # Step 2: model-id pattern match.
     if model_id:
         needle = model_id.lower()
-        if "qwen3.6" in needle:
+        # Qwen3.8 emits the same ``<think>`` format as 3.6, so it shares
+        # the qwen36 parser. Ordering matters: check the versioned
+        # patterns first so the more specific pattern wins.
+        if "qwen3.6" in needle or "qwen3.8" in needle:
             return _REASONING_PARSER_QWEN36
         # "qwen3.5" and bare "qwen3" both resolve to the existing qwen3
-        # parser. Ordering matters: check "qwen3.6" first so the more
-        # specific pattern wins.
+        # parser.
         if "qwen3" in needle:
             return REASONING_PARSER
 
